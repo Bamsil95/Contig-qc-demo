@@ -633,7 +633,7 @@ CONDITION_THRESHOLDS = {
     "30/40": (30, 40),
 }
 
-# 현재까지 확인된 네 AB1 쌍의 실제 결과로 보정한 조건별
+# 현재까지 확인된 다섯 AB1 쌍의 실제 결과로 보정한 조건별
 # 출력 유형입니다.
 # 20계열은 terminal overlap이 좋아 보여도 성공으로 자동 승격하지
 # 않고 F/R 개별 출력(Contig2)을 우선합니다.
@@ -790,6 +790,20 @@ def classify_contig_prediction(
         and terminal_pass
     )
 
+    # S-A 및 PW-41의 30/20 성공 사례처럼 junction에 비교적 긴
+    # 말단이 남아도 대부분이 New QT 미만이면 회사 프로그램이
+    # 저품질 말단을 제외한 뒤 조립하는 유형으로 해석합니다.
+    low_quality_terminal_rescue = (
+        overlap_length >= 200
+        and overlap_result["base_identity"] >= 98
+        and weighted_identity >= 92
+        and qt_matches >= 50
+        and qt_conflicts <= max(8, int(qt_matches * 0.15))
+        and 60 <= total_slack <= 180
+        and terminal_high_quality <= 30
+        and low_quality_fraction >= 0.70
+    )
+
     reverse_orientation = overlap_result.get(
         "reverse_orientation",
         "",
@@ -801,17 +815,30 @@ def classify_contig_prediction(
     if (
         condition_label == "30/20"
         and reverse_orientation == "Reverse-complement 적용"
-        and qt_longest_match_run >= 8
-        and (pass_conditions or tight_terminal_overlap)
+        and (
+            (
+                qt_longest_match_run >= 8
+                and (pass_conditions or tight_terminal_overlap)
+            )
+            or low_quality_terminal_rescue
+        )
     ):
+        if low_quality_terminal_rescue:
+            success_basis = (
+                "30/20 저품질 말단 soft-clip 성공 패턴 충족; "
+                f"말단 저품질 비율 {low_quality_fraction * 100:.1f}%"
+            )
+        else:
+            success_basis = (
+                "30/20 연속 Quality anchor 성공 패턴 충족; "
+                f"Q{qt_threshold} 최장 연속 match "
+                f"{qt_longest_match_run} bp"
+            )
+
         return {
             "status": "F+R 결합 성공 예상",
             "rank": 2,
-            "reason": (
-                "30/20 성공 보정 조건과 Quality 가중 overlap 충족; "
-                f"Q{qt_threshold} 최장 연속 match "
-                f"{qt_longest_match_run} bp"
-            ),
+            "reason": success_basis,
         }
 
     # HCU-A의 실제 QT10 성공 패턴입니다. Reverse 원본 방향에서
@@ -885,6 +912,7 @@ def classify_contig_prediction(
     if (
         condition_label == "30/20"
         and qt_longest_match_run < 8
+        and not low_quality_terminal_rescue
     ):
         no_contig_reasons.append(
             f"Q{qt_threshold} 최장 연속 match 8 bp 미만"
@@ -1130,7 +1158,7 @@ st.subheader("회사 프로그램 조건 설정")
 st.caption(
     "회사에서 실제 사용하는 조건을 개별 프리셋으로 평가합니다. "
     "30/40과 단독 10도 유효한 독립 조건입니다. 현재 조건별 "
-    "출력 유형은 현재 확인된 네 AB1 쌍의 실제 결과를 기준으로 "
+    "출력 유형은 현재 확인된 다섯 AB1 쌍의 실제 결과를 기준으로 "
     "보수적으로 보정되어 있으며, 추가 사례에 따라 갱신해야 "
     "합니다. 20계열의 좋은 junction은 성공을 확정하지 않고 "
     "Contig2를 우선합니다. "
@@ -1446,12 +1474,12 @@ if forward_file is not None and reverse_file is not None:
             )
 
             st.divider()
-            st.subheader("회사 조건별 Contig 시뮬레이터")
+            st.subheader("Contig 시뮬레이션 결과")
             st.caption(
-                "각 행은 동일한 AB1 쌍을 회사 프리셋별로 평가한 "
-                "결과입니다. F+R 결합 성공 예상, Contig2 예상, "
-                "No contig 예상 순으로 표시합니다. 현재 조건별 "
-                "prior는 한 개의 실제 보정 샘플에 기반합니다."
+                "동일한 AB1 쌍을 각 QT 조건으로 평가한 결과입니다. "
+                "카드는 F+R 결합 성공 예상, Contig2 예상, "
+                "No contig 예상 순으로 표시합니다. 판정은 현재까지 "
+                "확인된 다섯 AB1 쌍의 실제 결과로 보정했습니다."
             )
 
             simulation_display_rows = [
@@ -1465,12 +1493,6 @@ if forward_file is not None and reverse_file is not None:
 
             simulation_table = pd.DataFrame(
                 simulation_display_rows
-            )
-
-            st.dataframe(
-                simulation_table,
-                use_container_width=True,
-                hide_index=True,
             )
 
             if best_simulation is not None:
@@ -1494,6 +1516,84 @@ if forward_file is not None and reverse_file is not None:
                         + recommendation
                     )
 
+            success_count = sum(
+                row["Contig 예측"] == "F+R 결합 성공 예상"
+                for row in simulation_rows
+            )
+            contig2_count = sum(
+                row["Contig 예측"] == "Contig2 예상"
+                for row in simulation_rows
+            )
+            no_contig_count = sum(
+                row["Contig 예측"] == "No contig 예상"
+                for row in simulation_rows
+            )
+
+            summary_success, summary_contig2, summary_fail = st.columns(3)
+            summary_success.metric(
+                "결합 성공 예상",
+                f"{success_count}개 조건",
+            )
+            summary_contig2.metric(
+                "Contig2 예상",
+                f"{contig2_count}개 조건",
+            )
+            summary_fail.metric(
+                "No contig 예상",
+                f"{no_contig_count}개 조건",
+            )
+
+            for batch_start in range(0, len(simulation_rows), 4):
+                card_rows = simulation_rows[
+                    batch_start:batch_start + 4
+                ]
+                card_columns = st.columns(len(card_rows))
+
+                for card_column, row in zip(
+                    card_columns,
+                    card_rows,
+                ):
+                    with card_column:
+                        with st.container(border=True):
+                            st.markdown(
+                                f"### QT {row['회사 조건']}"
+                            )
+
+                            if (
+                                row["Contig 예측"]
+                                == "F+R 결합 성공 예상"
+                            ):
+                                st.success("✅ F+R 결합 성공 예상")
+                            elif row["Contig 예측"] == "Contig2 예상":
+                                st.warning("⚠️ Contig2 예상")
+                            else:
+                                st.error("❌ No contig 예상")
+
+                            metric_left, metric_right = st.columns(2)
+                            metric_left.metric(
+                                "Overlap",
+                                f"{row['Overlap']} bp",
+                            )
+                            metric_right.metric(
+                                "가중 Identity",
+                                (
+                                    f"{row['Quality 가중 Identity (%)']}%"
+                                ),
+                            )
+
+                            st.caption(
+                                "QT 연속 Match "
+                                f"{row['QT 최장 연속 Match']} bp"
+                            )
+                            st.caption(row["판정 근거"])
+
+            with st.expander("상세 수치 표 보기"):
+                st.dataframe(
+                    simulation_table,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
             simulation_csv = simulation_table.to_csv(
                 index=False
             ).encode("utf-8-sig")
@@ -1501,7 +1601,7 @@ if forward_file is not None and reverse_file is not None:
             st.download_button(
                 "시뮬레이션 결과 CSV 다운로드",
                 data=simulation_csv,
-                file_name="contig_company_condition_simulation.csv",
+                file_name="contig_simulation_results.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
