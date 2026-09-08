@@ -633,7 +633,14 @@ CONDITION_THRESHOLDS = {
     "30/40": (30, 40),
 }
 
-# 현재까지 확인된 다섯 AB1 쌍의 실제 결과로 보정한 조건별
+# 30/20에서 저품질 말단이 제거 가능하더라도, 짧은 overlap만으로
+# F/R 결합 성공을 과대 판정하지 않도록 하는 경험적 하한입니다.
+# 현재 성공 사례(KHS2: 75 bp)와 Contig2 사례
+# (WT: 60 bp, KNIBR033: 69 bp)를 기준으로 보정했습니다.
+MIN_DIRECT_30_20_OVERLAP = 70
+MIN_CONTIG2_OVERLAP = 40
+
+# 현재까지 확인된 일곱 AB1 쌍의 실제 결과로 보정한 조건별
 # 출력 유형입니다.
 # 20계열은 terminal overlap이 좋아 보여도 성공으로 자동 승격하지
 # 않고 F/R 개별 출력(Contig2)을 우선합니다.
@@ -810,18 +817,20 @@ def classify_contig_prediction(
     )
 
     # 현재 확인된 NS1/NS24 및 785F/907R 성공 패턴입니다.
-    # Reverse read를 reverse-complement한 연결이면서 30/20의
-    # Quality 근거를 충족할 때만 성공 후보로 승격합니다.
+    # 짧은 overlap은 말단 품질이 좋아도 회사 프로그램에서
+    # Contig2로 남을 수 있으므로, 직접 결합형에는 최소 70 bp의
+    # overlap을 요구합니다. 긴 저품질 말단 rescue 유형은 별도로
+    # 평가합니다.
+    direct_30_20_success = (
+        overlap_length >= MIN_DIRECT_30_20_OVERLAP
+        and qt_longest_match_run >= 8
+        and (pass_conditions or tight_terminal_overlap)
+    )
+
     if (
         condition_label == "30/20"
         and reverse_orientation == "Reverse-complement 적용"
-        and (
-            (
-                qt_longest_match_run >= 8
-                and (pass_conditions or tight_terminal_overlap)
-            )
-            or low_quality_terminal_rescue
-        )
+        and (direct_30_20_success or low_quality_terminal_rescue)
     ):
         if low_quality_terminal_rescue:
             success_basis = (
@@ -839,6 +848,31 @@ def classify_contig_prediction(
             "status": "F+R 결합 성공 예상",
             "rank": 2,
             "reason": success_basis,
+        }
+
+    # WT-260831-28 및 KNIBR033의 실제 30/20 Contig2 패턴입니다.
+    # Quality와 junction은 양호하지만 overlap 자체가 70 bp보다
+    # 짧아 하나의 안정적인 consensus로 승격되기에는 근거가
+    # 부족한 경우 F/R 개별 출력으로 분류합니다.
+    short_overlap_contig2 = (
+        condition_label == "30/20"
+        and reverse_orientation == "Reverse-complement 적용"
+        and MIN_CONTIG2_OVERLAP
+        <= overlap_length
+        < MIN_DIRECT_30_20_OVERLAP
+        and qt_longest_match_run >= 8
+        and (pass_conditions or tight_terminal_overlap)
+    )
+
+    if short_overlap_contig2:
+        return {
+            "status": "Contig2 예상",
+            "rank": 1,
+            "reason": (
+                "30/20 정렬 근거는 있으나 terminal overlap "
+                f"{overlap_length} bp로 {MIN_DIRECT_30_20_OVERLAP} "
+                "bp 미만; F/R 개별 출력 보정 패턴"
+            ),
         }
 
     # HCU-A의 실제 QT10 성공 패턴입니다. Reverse 원본 방향에서
@@ -1158,7 +1192,7 @@ st.subheader("회사 프로그램 조건 설정")
 st.caption(
     "회사에서 실제 사용하는 조건을 개별 프리셋으로 평가합니다. "
     "30/40과 단독 10도 유효한 독립 조건입니다. 현재 조건별 "
-    "출력 유형은 현재 확인된 다섯 AB1 쌍의 실제 결과를 기준으로 "
+    "출력 유형은 현재 확인된 일곱 AB1 쌍의 실제 결과를 기준으로 "
     "보수적으로 보정되어 있으며, 추가 사례에 따라 갱신해야 "
     "합니다. 20계열의 좋은 junction은 성공을 확정하지 않고 "
     "Contig2를 우선합니다. "
@@ -1479,7 +1513,7 @@ if forward_file is not None and reverse_file is not None:
                 "동일한 AB1 쌍을 각 QT 조건으로 평가한 결과입니다. "
                 "카드는 F+R 결합 성공 예상, Contig2 예상, "
                 "No contig 예상 순으로 표시합니다. 판정은 현재까지 "
-                "확인된 다섯 AB1 쌍의 실제 결과로 보정했습니다."
+                "확인된 일곱 AB1 쌍의 실제 결과로 보정했습니다."
             )
 
             simulation_display_rows = [
