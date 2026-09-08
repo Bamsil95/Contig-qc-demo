@@ -366,28 +366,35 @@ def build_terminal_candidate(
 
         return sum(value >= threshold for value in values) / len(values)
 
-    if new_qt_threshold > 0:
+    new_qt_enabled = new_qt_threshold is not None
+    terminal_quality_threshold = (
+        new_qt_threshold
+        if new_qt_enabled
+        else qt_threshold
+    )
+
+    if terminal_quality_threshold > 0:
         terminal_high_quality_bases = sum(
-            quality >= new_qt_threshold
+            quality >= terminal_quality_threshold
             for quality in terminal_qualities
         )
         terminal_quality_burden = sum(
-            max(quality - new_qt_threshold + 1, 0)
-            / max(41 - new_qt_threshold, 1)
+            max(quality - terminal_quality_threshold + 1, 0)
+            / max(41 - terminal_quality_threshold, 1)
             for quality in terminal_qualities
         )
     else:
-        # New QT 0에서는 soft clipping을 허용하지 않는 보수적 조건
+        # 품질 경계가 0인 예외 조건은 모든 말단 염기를 유지합니다.
         terminal_high_quality_bases = terminal_slack_total
         terminal_quality_burden = float(terminal_slack_total)
 
-    if new_qt_threshold > 0:
+    if terminal_quality_threshold > 0:
         left_terminal_high_quality = sum(
-            quality >= new_qt_threshold
+            quality >= terminal_quality_threshold
             for quality in left_tail_qualities
         )
         right_terminal_high_quality = sum(
-            quality >= new_qt_threshold
+            quality >= terminal_quality_threshold
             for quality in right_head_qualities
         )
     else:
@@ -529,6 +536,8 @@ def build_terminal_candidate(
             terminal_low_quality_fraction,
             4,
         ),
+        "new_qt_enabled": new_qt_enabled,
+        "terminal_quality_threshold": terminal_quality_threshold,
         "forward_junction_softclip": forward_junction.get(
             "softclip",
             0,
@@ -728,18 +737,21 @@ def analyze_best_reverse_orientation(
 # 회사 프로그램 조건 프리셋
 # --------------------------------------------------
 COMPANY_CONDITIONS = [
-    "10",
-    "20/0",
+    "16",
+    "20",
     "20/10",
     "20/20",
     "30/10",
     "30/20",
     "30/40",
+    "10",
 ]
 
 CONDITION_THRESHOLDS = {
-    "10": (10, 0),
-    "20/0": (20, 0),
+    # None은 New QT 체크 해제(미사용)를 의미합니다.
+    "16": (16, None),
+    "10": (10, None),
+    "20": (20, None),
     "20/10": (20, 10),
     "20/20": (20, 20),
     "30/10": (30, 10),
@@ -760,7 +772,7 @@ MIN_CONTIG2_OVERLAP = 40
 # 않고 F/R 개별 출력(Contig2)을 우선합니다.
 CONTIG2_CALIBRATED_CONDITIONS = {
     "10",
-    "20/0",
+    "20",
     "20/10",
     "20/20",
 }
@@ -817,6 +829,12 @@ def classify_contig_prediction(
     low_quality_fraction = overlap_result[
         "terminal_low_quality_fraction"
     ]
+    new_qt_enabled = new_qt_threshold is not None
+    boundary_label = (
+        f"New QT {new_qt_threshold}"
+        if new_qt_enabled
+        else f"QT {qt_threshold}"
+    )
 
     structural_fail_reasons = []
 
@@ -846,12 +864,13 @@ def classify_contig_prediction(
         )
 
     if (
-        new_qt_threshold > 0
+        new_qt_enabled
         and terminal_high_quality
         > max(100, int(overlap_length * 0.75))
     ):
         structural_fail_reasons.append(
-            f"New QT 이상 말단 염기 {terminal_high_quality}개"
+            f"{boundary_label} 이상 말단 염기 "
+            f"{terminal_high_quality}개"
         )
 
     if structural_fail_reasons:
@@ -892,16 +911,13 @@ def classify_contig_prediction(
 
     pass_conflict_limit = max(8, int(qt_matches * 0.15))
 
-    if new_qt_threshold > 0:
-        terminal_pass = (
-            terminal_high_quality <= 30
-            and (
-                total_slack <= 20
-                or low_quality_fraction >= 0.65
-            )
+    terminal_pass = (
+        terminal_high_quality <= 30
+        and (
+            total_slack <= 20
+            or low_quality_fraction >= 0.65
         )
-    else:
-        terminal_pass = total_slack <= 5
+    )
 
     pass_conditions = (
         overlap_length >= 25
@@ -989,6 +1005,31 @@ def classify_contig_prediction(
             ),
         }
 
+    # 16S 기본값인 QT16 단독 조건입니다. New QT를 사용하지 않고
+    # QT16을 말단 품질 경계로 삼아 구조적 overlap을 평가합니다.
+    # 아직 실제 QT16 사례가 충분하지 않으므로 보수적인 임시 기준을
+    # 사용하며, 후속 실제 결과로 계속 보정합니다.
+    qt16_only_success = (
+        condition_label == "16"
+        and overlap_length >= 40
+        and overlap_result["base_identity"] >= 97
+        and weighted_identity >= 90
+        and qt_matches >= 25
+        and qt_longest_match_run >= 8
+        and qt_conflicts <= max(8, int(qt_matches * 0.20))
+        and (terminal_pass or tight_terminal_overlap)
+    )
+
+    if qt16_only_success:
+        return {
+            "status": "F+R 결합 성공 예상",
+            "rank": 2,
+            "reason": (
+                "QT16 단독 조건의 terminal overlap 기준 충족; "
+                f"Q16 최장 연속 match {qt_longest_match_run} bp"
+            ),
+        }
+
     # HCU-A의 실제 QT10 성공 패턴입니다. Reverse 원본 방향에서
     # 매우 직접적인 terminal overlap이 확인되는 경우에 한해
     # QT10 성공 후보로 판정합니다.
@@ -1032,6 +1073,16 @@ def classify_contig_prediction(
             ),
         }
 
+    if condition_label == "16":
+        return {
+            "status": "Contig2 예상",
+            "rank": 1,
+            "reason": (
+                "QT16 단독 조건에서 overlap 후보는 있으나 직접 "
+                "결합 기준 미충족; 실제 QT16 사례 추가 보정 필요"
+            ),
+        }
+
     if condition_label in CONTIG2_CALIBRATED_CONDITIONS:
         return {
             "status": "Contig2 예상",
@@ -1072,14 +1123,14 @@ def classify_contig_prediction(
         )
 
     if not terminal_pass:
-        if new_qt_threshold > 0:
+        if new_qt_enabled:
             no_contig_reasons.append(
-                f"New QT 이상 soft-clip 염기 "
+                f"{boundary_label} 이상 soft-clip 염기 "
                 f"{terminal_high_quality}개"
             )
         else:
             no_contig_reasons.append(
-                f"New QT 0 junction 잔여 {total_slack} bp"
+                f"{boundary_label} 단독 조건의 junction 경계 미충족"
             )
 
     return {
@@ -1686,7 +1737,7 @@ def simulate_company_conditions(
                 "QT": qt_value,
                 "New QT": (
                     "-"
-                    if condition_label == "10"
+                    if current_new_qt is None
                     else str(current_new_qt)
                 ),
                 "Overlap": overlap_result["paired_bases"],
@@ -1721,7 +1772,7 @@ def simulate_company_conditions(
                 "오른쪽 junction soft-clip": overlap_result[
                     "right_head_unaligned"
                 ],
-                "New QT 이상 soft-clip 염기": overlap_result[
+                "경계 기준 이상 soft-clip 염기": overlap_result[
                     "terminal_high_quality_bases"
                 ],
                 "soft-clip 저품질 비율 (%)": round(
@@ -1746,8 +1797,8 @@ def simulate_company_conditions(
             -row["_rank"],
             -row["Quality 가중 Identity (%)"],
             -row["QT 지지 Match"],
-            row["New QT 이상 soft-clip 염기"]
-            if row["New QT 이상 soft-clip 염기"] is not None
+            row["경계 기준 이상 soft-clip 염기"]
+            if row["경계 기준 이상 soft-clip 염기"] is not None
             else float("inf"),
             -row["Overlap"],
             row["_condition_order"],
@@ -1766,8 +1817,8 @@ def choose_best_simulation(simulation_rows):
             row["Quality 가중 Identity (%)"],
             row["QT 지지 Match"],
             -(
-                row["New QT 이상 soft-clip 염기"]
-                if row["New QT 이상 soft-clip 염기"]
+                row["경계 기준 이상 soft-clip 염기"]
+                if row["경계 기준 이상 soft-clip 염기"]
                 is not None
                 else 10**9
             ),
@@ -1841,11 +1892,13 @@ st.subheader("조건 설정")
 
 st.caption(
     "실제 분석에 사용하는 조건을 개별 프리셋으로 평가합니다. "
+    "16과 20은 New QT를 사용하지 않는 단독 QT 조건이며, "
     "30/40과 단독 10도 유효한 독립 조건입니다. 현재 조건별 "
     "출력 유형은 현재 확인된 일곱 AB1 쌍의 실제 결과를 기준으로 "
     "보수적으로 보정되어 있으며, 추가 사례에 따라 갱신해야 "
     "합니다. 20계열의 좋은 junction은 성공을 확정하지 않고 "
-    "Contig2를 우선합니다. "
+    "Contig2를 우선합니다. QT16 결과는 아직 실제 보정 사례가 "
+    "부족해 구조적 기준으로 우선 평가합니다. "
     "Primer 파일명은 판정에 사용하지 않고 Reverse 원본과 "
     "reverse-complement를 모두 비교해 정렬 방향을 선택합니다."
 )
@@ -1853,7 +1906,7 @@ st.caption(
 selected_condition = st.selectbox(
     "현재 분석 조건",
     options=COMPANY_CONDITIONS,
-    index=COMPANY_CONDITIONS.index("30/20"),
+    index=COMPANY_CONDITIONS.index("16"),
 )
 
 qt_threshold, new_qt_threshold = parse_company_condition(
@@ -2082,7 +2135,7 @@ if forward_file is not None and reverse_file is not None:
                             "Soft-clip 합계": overlap_result[
                                 "terminal_slack_total"
                             ],
-                            "New QT 이상 soft-clip 염기": overlap_result[
+                            "경계 기준 이상 soft-clip 염기": overlap_result[
                                 "terminal_high_quality_bases"
                             ],
                             "Soft-clip 저품질 비율 (%)": round(
@@ -2113,8 +2166,8 @@ if forward_file is not None and reverse_file is not None:
 - **왼쪽 junction soft-clip**은 왼쪽 read의 정렬 종료 뒤에 남아, 연결을 위해 제외해야 하는 말단 염기 수입니다.
 - **오른쪽 junction soft-clip**은 오른쪽 read의 정렬 시작 전에 남아, 연결을 위해 제외해야 하는 말단 염기 수입니다.
 - **Soft-clip 합계**는 위 두 값의 합입니다. 작을수록 두 read가 말단에서 직접 만나지만, 작다는 이유만으로 contig 성공이 확정되지는 않습니다.
-- **New QT 이상 soft-clip 염기**는 제외 후보 중 품질이 New QT 이상인 염기 수입니다. 값이 크면 신뢰도 높은 서열을 많이 버려야 하므로 불리합니다.
-- **Soft-clip 저품질 비율**은 제외 후보 중 New QT 미만 염기의 비율입니다. 높을수록 말단 제외가 합리적이라는 보조 근거입니다.
+- **경계 기준 이상 soft-clip 염기**는 제외 후보 중 현재 품질 경계 이상인 염기 수입니다. New QT 사용 조건에서는 New QT, 미사용 조건에서는 QT가 경계가 됩니다. 값이 크면 신뢰도 높은 서열을 많이 버려야 하므로 불리합니다.
+- **Soft-clip 저품질 비율**은 제외 후보 중 현재 품질 경계 미만 염기의 비율입니다. 높을수록 말단 제외가 합리적이라는 보조 근거입니다.
 - **QT 최장 연속 Match**는 양쪽 염기가 모두 현재 QT 이상이면서 정확히 일치하는 구간 중 가장 긴 연속 길이입니다. QT 지지 Match 총량이 많아도 이 값이 짧으면 고품질 anchor가 여러 조각으로 끊긴 상태입니다.
                         """
                     )
@@ -2129,7 +2182,7 @@ if forward_file is not None and reverse_file is not None:
                     st.caption(
                         "Gap을 일률적으로 동일 감점하지 않고 해당 "
                         "염기의 Quality로 가중했습니다. 정렬 밖 "
-                        "junction 염기도 New QT 미만이면 저품질 "
+                        "junction 염기도 현재 품질 경계 미만이면 저품질 "
                         "soft-clip 후보로 취급합니다."
                     )
 
@@ -2173,7 +2226,9 @@ if forward_file is not None and reverse_file is not None:
                 "동일한 AB1 쌍을 각 QT 조건으로 평가한 결과입니다. "
                 "카드는 F+R 결합 성공 예상, Contig2 예상, "
                 "No contig 예상 순으로 표시합니다. 판정은 현재까지 "
-                "확인된 일곱 AB1 쌍의 실제 결과로 보정했습니다."
+                "확인된 일곱 AB1 쌍의 실제 결과로 보정했습니다. "
+                "QT16은 실제 사례가 누적되기 전까지 구조 기반 "
+                "임시 판정입니다."
             )
 
             simulation_display_rows = [
