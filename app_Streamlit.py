@@ -133,6 +133,7 @@ def normalize_alignment_sequence(sequence):
 # --------------------------------------------------
 TERMINAL_SEARCH_BASES = 700
 GAP_QUALITY_WEIGHT = 0.5
+JUNCTION_ANCHOR_BASES = 60
 
 
 def quality_weight(quality):
@@ -343,6 +344,28 @@ def build_terminal_candidate(
     )
     terminal_slack_total = len(terminal_qualities)
 
+    # 정렬 경계 안쪽의 품질을 read별로 따로 평가합니다. 이 값은
+    # contig 성공 여부가 아니라 어느 방향의 재반응이 더 유리한지
+    # 판단하는 보조 근거로 사용합니다.
+    left_anchor_qualities = left_qualities[
+        max(left_start, left_end - JUNCTION_ANCHOR_BASES):left_end
+    ]
+    right_anchor_qualities = right_qualities[
+        right_start:min(
+            right_end,
+            right_start + JUNCTION_ANCHOR_BASES,
+        )
+    ]
+
+    def mean_quality(values):
+        return sum(values) / len(values) if values else 0.0
+
+    def threshold_fraction(values, threshold):
+        if not values:
+            return 0.0
+
+        return sum(value >= threshold for value in values) / len(values)
+
     if new_qt_threshold > 0:
         terminal_high_quality_bases = sum(
             quality >= new_qt_threshold
@@ -357,6 +380,61 @@ def build_terminal_candidate(
         # New QT 0에서는 soft clipping을 허용하지 않는 보수적 조건
         terminal_high_quality_bases = terminal_slack_total
         terminal_quality_burden = float(terminal_slack_total)
+
+    if new_qt_threshold > 0:
+        left_terminal_high_quality = sum(
+            quality >= new_qt_threshold
+            for quality in left_tail_qualities
+        )
+        right_terminal_high_quality = sum(
+            quality >= new_qt_threshold
+            for quality in right_head_qualities
+        )
+    else:
+        left_terminal_high_quality = len(left_tail_qualities)
+        right_terminal_high_quality = len(right_head_qualities)
+
+    left_terminal_low_quality = (
+        len(left_tail_qualities) - left_terminal_high_quality
+    )
+    right_terminal_low_quality = (
+        len(right_head_qualities) - right_terminal_high_quality
+    )
+
+    left_source = "Forward" if left_label == "Forward" else "Reverse"
+    right_source = "Forward" if right_label == "Forward" else "Reverse"
+
+    junction_metrics_by_source = {
+        left_source: {
+            "softclip": len(left_tail_qualities),
+            "high_quality_softclip": left_terminal_high_quality,
+            "low_quality_softclip": left_terminal_low_quality,
+            "anchor_mean_quality": mean_quality(left_anchor_qualities),
+            "anchor_qt_fraction": threshold_fraction(
+                left_anchor_qualities,
+                qt_threshold,
+            ),
+        },
+        right_source: {
+            "softclip": len(right_head_qualities),
+            "high_quality_softclip": right_terminal_high_quality,
+            "low_quality_softclip": right_terminal_low_quality,
+            "anchor_mean_quality": mean_quality(right_anchor_qualities),
+            "anchor_qt_fraction": threshold_fraction(
+                right_anchor_qualities,
+                qt_threshold,
+            ),
+        },
+    }
+
+    forward_junction = junction_metrics_by_source.get(
+        "Forward",
+        {},
+    )
+    reverse_junction = junction_metrics_by_source.get(
+        "Reverse",
+        {},
+    )
 
     terminal_low_quality_fraction = (
         (
@@ -449,6 +527,42 @@ def build_terminal_candidate(
         ),
         "terminal_low_quality_fraction": round(
             terminal_low_quality_fraction,
+            4,
+        ),
+        "forward_junction_softclip": forward_junction.get(
+            "softclip",
+            0,
+        ),
+        "reverse_junction_softclip": reverse_junction.get(
+            "softclip",
+            0,
+        ),
+        "forward_junction_high_quality_softclip": (
+            forward_junction.get("high_quality_softclip", 0)
+        ),
+        "reverse_junction_high_quality_softclip": (
+            reverse_junction.get("high_quality_softclip", 0)
+        ),
+        "forward_junction_low_quality_softclip": (
+            forward_junction.get("low_quality_softclip", 0)
+        ),
+        "reverse_junction_low_quality_softclip": (
+            reverse_junction.get("low_quality_softclip", 0)
+        ),
+        "forward_junction_anchor_mean_quality": round(
+            forward_junction.get("anchor_mean_quality", 0.0),
+            2,
+        ),
+        "reverse_junction_anchor_mean_quality": round(
+            reverse_junction.get("anchor_mean_quality", 0.0),
+            2,
+        ),
+        "forward_junction_anchor_qt_fraction": round(
+            forward_junction.get("anchor_qt_fraction", 0.0),
+            4,
+        ),
+        "reverse_junction_anchor_qt_fraction": round(
+            reverse_junction.get("anchor_qt_fraction", 0.0),
             4,
         ),
         "candidate_is_usable": candidate_is_usable,
@@ -660,7 +774,7 @@ NO_CONTIG_CALIBRATED_CONDITIONS = {
 def parse_company_condition(condition_label):
     if condition_label not in CONDITION_THRESHOLDS:
         raise ValueError(
-            f"지원하지 않는 회사 조건입니다: {condition_label}"
+            f"지원하지 않는 조건입니다: {condition_label}"
         )
 
     return CONDITION_THRESHOLDS[condition_label]
@@ -976,6 +1090,542 @@ def classify_contig_prediction(
 
 
 # --------------------------------------------------
+# 재반응 방향 및 기대 효과 평가
+# --------------------------------------------------
+def estimate_quality_readthrough(
+    qualities,
+    threshold=20,
+    window_size=20,
+):
+    """마지막으로 안정적인 Quality window가 끝나는 위치를 구합니다."""
+
+    if not qualities:
+        return 0
+
+    if len(qualities) < window_size:
+        average_quality = sum(qualities) / len(qualities)
+        supported_fraction = sum(
+            quality >= threshold
+            for quality in qualities
+        ) / len(qualities)
+
+        if average_quality >= threshold and supported_fraction >= 0.70:
+            return len(qualities)
+
+        return 0
+
+    last_supported_end = 0
+
+    for start in range(0, len(qualities) - window_size + 1):
+        quality_window = qualities[start:start + window_size]
+        average_quality = sum(quality_window) / window_size
+        supported_fraction = sum(
+            quality >= threshold
+            for quality in quality_window
+        ) / window_size
+
+        if average_quality >= threshold and supported_fraction >= 0.70:
+            last_supported_end = start + window_size
+
+    return last_supported_end
+
+
+def build_reaction_quality_profile(
+    read_data,
+    source_name,
+    overlap_result,
+    qt_threshold,
+):
+    """재반응 필요도를 read별로 계산하는 경험적 품질 프로필입니다."""
+
+    sequence = normalize_alignment_sequence(read_data["sequence"])
+    qualities = normalize_quality_scores(
+        sequence,
+        read_data["quality_scores"],
+    )
+    read_length = len(sequence)
+
+    if read_length > 0:
+        average_quality = sum(qualities) / read_length
+        q20_fraction = sum(
+            quality >= 20
+            for quality in qualities
+        ) / read_length
+        q30_fraction = sum(
+            quality >= 30
+            for quality in qualities
+        ) / read_length
+        ambiguous_fraction = sequence.count("N") / read_length
+    else:
+        average_quality = 0.0
+        q20_fraction = 0.0
+        q30_fraction = 0.0
+        ambiguous_fraction = 1.0
+
+    readthrough_length = estimate_quality_readthrough(
+        qualities,
+        threshold=20,
+    )
+    readthrough_fraction = (
+        readthrough_length / read_length
+        if read_length > 0
+        else 0.0
+    )
+
+    source_key = source_name.lower()
+    junction_softclip = 0
+    junction_high_quality_softclip = 0
+    junction_low_quality_softclip = 0
+    junction_anchor_mean_quality = 0.0
+    junction_anchor_qt_fraction = 0.0
+
+    if overlap_result is not None:
+        junction_softclip = overlap_result.get(
+            f"{source_key}_junction_softclip",
+            0,
+        )
+        junction_high_quality_softclip = overlap_result.get(
+            f"{source_key}_junction_high_quality_softclip",
+            0,
+        )
+        junction_low_quality_softclip = overlap_result.get(
+            f"{source_key}_junction_low_quality_softclip",
+            0,
+        )
+        junction_anchor_mean_quality = overlap_result.get(
+            f"{source_key}_junction_anchor_mean_quality",
+            0.0,
+        )
+        junction_anchor_qt_fraction = overlap_result.get(
+            f"{source_key}_junction_anchor_qt_fraction",
+            0.0,
+        )
+
+    need_score = 0
+    need_reasons = []
+
+    if average_quality < 20:
+        need_score += 3
+        need_reasons.append("평균 Quality 낮음")
+    elif average_quality < 28:
+        need_score += 1
+        need_reasons.append("평균 Quality 경계")
+
+    if q20_fraction < 0.45:
+        need_score += 3
+        need_reasons.append("Q20 염기 비율 낮음")
+    elif q20_fraction < 0.65:
+        need_score += 1
+        need_reasons.append("Q20 염기 비율 경계")
+
+    if q30_fraction < 0.20:
+        need_score += 2
+        need_reasons.append("Q30 염기 비율 낮음")
+    elif q30_fraction < 0.40:
+        need_score += 1
+        need_reasons.append("Q30 염기 비율 경계")
+
+    if readthrough_fraction < 0.45:
+        need_score += 3
+        need_reasons.append("Q20 read-through 짧음")
+    elif readthrough_fraction < 0.70:
+        need_score += 1
+        need_reasons.append("Q20 read-through 경계")
+
+    if ambiguous_fraction > 0.05:
+        need_score += 3
+        need_reasons.append("N 염기 비율 높음")
+    elif ambiguous_fraction > 0.02:
+        need_score += 1
+        need_reasons.append("N 염기 존재")
+
+    if overlap_result is not None:
+        if junction_anchor_mean_quality < max(10, qt_threshold - 5):
+            need_score += 3
+            need_reasons.append("junction anchor Quality 낮음")
+        elif junction_anchor_mean_quality < qt_threshold:
+            need_score += 2
+            need_reasons.append("junction anchor Quality 부족")
+        elif junction_anchor_mean_quality < qt_threshold + 5:
+            need_score += 1
+            need_reasons.append("junction anchor Quality 경계")
+
+        if junction_anchor_qt_fraction < 0.35:
+            need_score += 3
+            need_reasons.append("junction QT 지지율 낮음")
+        elif junction_anchor_qt_fraction < 0.65:
+            need_score += 2
+            need_reasons.append("junction QT 지지율 부족")
+        elif junction_anchor_qt_fraction < 0.80:
+            need_score += 1
+            need_reasons.append("junction QT 지지율 경계")
+
+        if junction_low_quality_softclip >= 50:
+            need_score += 2
+            need_reasons.append("저품질 junction 말단 김")
+        elif junction_low_quality_softclip >= 15:
+            need_score += 1
+            need_reasons.append("저품질 junction 말단 존재")
+
+    if need_score >= 7:
+        need_level = "높음"
+    elif need_score >= 2:
+        need_level = "중간"
+    else:
+        need_level = "낮음"
+
+    return {
+        "source": source_name,
+        "need_score": need_score,
+        "need_level": need_level,
+        "need_reasons": need_reasons,
+        "read_length": read_length,
+        "average_quality": round(average_quality, 2),
+        "q20_fraction": round(q20_fraction, 4),
+        "q30_fraction": round(q30_fraction, 4),
+        "readthrough_length": readthrough_length,
+        "readthrough_fraction": round(readthrough_fraction, 4),
+        "ambiguous_fraction": round(ambiguous_fraction, 4),
+        "junction_softclip": junction_softclip,
+        "junction_high_quality_softclip": (
+            junction_high_quality_softclip
+        ),
+        "junction_low_quality_softclip": (
+            junction_low_quality_softclip
+        ),
+        "junction_anchor_mean_quality": round(
+            junction_anchor_mean_quality,
+            2,
+        ),
+        "junction_anchor_qt_fraction": round(
+            junction_anchor_qt_fraction,
+            4,
+        ),
+    }
+
+
+def evaluate_structural_support(overlap_result, qt_threshold):
+    """재반응으로 회복 가능한 overlap 구조인지 3단계로 평가합니다."""
+
+    if overlap_result is None:
+        return {
+            "level": "낮음",
+            "score": 0,
+            "reason": "terminal overlap 후보가 없습니다.",
+        }
+
+    overlap_length = overlap_result["paired_bases"]
+    base_identity = overlap_result["base_identity"]
+    weighted_identity = overlap_result["quality_weighted_identity"]
+    qt_matches = overlap_result["qt_supported_matches"]
+    qt_conflicts = overlap_result["qt_supported_conflicts"]
+    terminal_high_quality = overlap_result[
+        "terminal_high_quality_bases"
+    ]
+
+    support_score = 0
+
+    if overlap_length >= 70:
+        support_score += 2
+    elif overlap_length >= 35:
+        support_score += 1
+
+    if base_identity >= 97:
+        support_score += 2
+    elif base_identity >= 90:
+        support_score += 1
+
+    if weighted_identity >= 92:
+        support_score += 2
+    elif weighted_identity >= 85:
+        support_score += 1
+
+    if qt_matches >= 30:
+        support_score += 2
+    elif qt_matches >= 15:
+        support_score += 1
+
+    if qt_conflicts <= max(5, int(qt_matches * 0.15)):
+        support_score += 1
+
+    if terminal_high_quality <= 30:
+        support_score += 1
+
+    if support_score >= 8:
+        support_level = "높음"
+    elif support_score >= 5:
+        support_level = "중간"
+    else:
+        support_level = "낮음"
+
+    return {
+        "level": support_level,
+        "score": support_score,
+        "reason": (
+            f"terminal overlap {overlap_length} bp, "
+            f"Quality 가중 Identity {weighted_identity}%, "
+            f"Q{qt_threshold} 지지 match {qt_matches} bp"
+        ),
+    }
+
+
+def expectation_level(score):
+    if score >= 2:
+        return "높음"
+    if score >= 1:
+        return "중간"
+    return "낮음"
+
+
+def evaluate_rerun_scenarios(
+    forward_data,
+    reverse_data,
+    overlap_result,
+    current_prediction,
+    simulation_rows,
+    selected_condition,
+    qt_threshold,
+):
+    """
+    현재 AB1에서 품질 제한 방향과 구조적 overlap 가능성을 분리해
+    F/R 재반응의 상대적 기대 효과를 제시합니다.
+    """
+
+    forward_profile = build_reaction_quality_profile(
+        forward_data,
+        "Forward",
+        overlap_result,
+        qt_threshold,
+    )
+    reverse_profile = build_reaction_quality_profile(
+        reverse_data,
+        "Reverse",
+        overlap_result,
+        qt_threshold,
+    )
+    structural_support = evaluate_structural_support(
+        overlap_result,
+        qt_threshold,
+    )
+
+    successful_conditions = [
+        row["조건"]
+        for row in simulation_rows
+        if row["Contig 예측"] == "F+R 결합 성공 예상"
+    ]
+    current_success = (
+        current_prediction["status"] == "F+R 결합 성공 예상"
+    )
+    alternative_successes = [
+        condition
+        for condition in successful_conditions
+        if condition != selected_condition
+    ]
+
+    if current_success:
+        recommendation = "재반응 불필요"
+        recommendation_reason = (
+            f"현재 조건 {selected_condition}에서 F+R 결합 성공이 "
+            "예상됩니다."
+        )
+        forward_effect = 0
+        reverse_effect = 0
+        both_effect = 0
+        failure_risk = 0
+        confidence = "높음"
+
+    elif alternative_successes:
+        preferred_condition = alternative_successes[0]
+        recommendation = f"조건 {preferred_condition} 적용 우선"
+        recommendation_reason = (
+            "재반응 전에 동일 AB1의 성공 예상 조건을 먼저 적용하는 "
+            "편이 효율적입니다."
+        )
+        forward_effect = 0
+        reverse_effect = 0
+        both_effect = 0
+        failure_risk = 0
+        confidence = "중간"
+
+    else:
+        forward_need = forward_profile["need_score"]
+        reverse_need = reverse_profile["need_score"]
+        structural_score = structural_support["score"]
+
+        def one_side_effect(side_need, other_need):
+            if structural_score < 5:
+                return 1 if side_need >= 7 and other_need < 7 else 0
+
+            if side_need >= 7 and other_need < 7:
+                return 2
+
+            if (
+                side_need >= 4
+                and side_need - other_need >= 2
+            ):
+                return 2 if structural_score >= 8 else 1
+
+            if (
+                side_need >= 2
+                and side_need - other_need >= 2
+            ):
+                return 1
+
+            if side_need >= 3:
+                return 1
+
+            return 0
+
+        forward_effect = one_side_effect(
+            forward_need,
+            reverse_need,
+        )
+        reverse_effect = one_side_effect(
+            reverse_need,
+            forward_need,
+        )
+
+        if structural_score >= 8 and min(
+            forward_need,
+            reverse_need,
+        ) >= 3:
+            both_effect = 2
+        elif structural_score >= 5 and max(
+            forward_need,
+            reverse_need,
+        ) >= 3:
+            both_effect = 1
+        elif structural_score < 5 and min(
+            forward_need,
+            reverse_need,
+        ) >= 7:
+            both_effect = 1
+        else:
+            both_effect = 0
+
+        if structural_score < 5:
+            failure_risk = 2
+        elif (
+            forward_need < 2
+            and reverse_need < 2
+            and not current_success
+        ):
+            failure_risk = 2
+        elif structural_score < 8:
+            failure_risk = 1
+        elif max(forward_need, reverse_need) >= 7:
+            failure_risk = 0
+        else:
+            failure_risk = 1
+
+        if failure_risk >= 2 and max(
+            forward_effect,
+            reverse_effect,
+            both_effect,
+        ) == 0:
+            recommendation = "단순 재반응 효과 낮음"
+            recommendation_reason = (
+                "품질보다 pairing, primer, 혼합 template 또는 "
+                "구조적 overlap 문제를 먼저 확인해야 합니다."
+            )
+        elif (
+            both_effect > max(forward_effect, reverse_effect)
+            or (
+                both_effect >= 1
+                and abs(forward_need - reverse_need) <= 1
+                and min(forward_need, reverse_need) >= 3
+            )
+        ):
+            recommendation = "양방향 재반응 권장"
+            recommendation_reason = (
+                "F와 R 모두 품질 보완 필요성이 확인됩니다."
+            )
+        elif forward_effect > reverse_effect:
+            recommendation = "Forward만 재반응 우선"
+            recommendation_reason = (
+                "Forward가 Reverse보다 결합 제한 요인으로 평가됩니다."
+            )
+        elif reverse_effect > forward_effect:
+            recommendation = "Reverse만 재반응 우선"
+            recommendation_reason = (
+                "Reverse가 Forward보다 결합 제한 요인으로 평가됩니다."
+            )
+        elif forward_profile["need_score"] > reverse_profile["need_score"]:
+            recommendation = "Forward만 재반응 검토"
+            recommendation_reason = (
+                "Forward의 상대적 품질 보완 필요성이 더 큽니다."
+            )
+        elif reverse_profile["need_score"] > forward_profile["need_score"]:
+            recommendation = "Reverse만 재반응 검토"
+            recommendation_reason = (
+                "Reverse의 상대적 품질 보완 필요성이 더 큽니다."
+            )
+        else:
+            recommendation = "양방향 재반응 검토"
+            recommendation_reason = (
+                "한 방향만을 우선할 근거가 충분하지 않습니다."
+            )
+
+        if structural_score >= 8 and abs(
+            forward_need - reverse_need
+        ) >= 5:
+            confidence = "높음"
+        elif structural_score >= 5:
+            confidence = "중간"
+        else:
+            confidence = "낮음"
+
+    forward_reason = (
+        f"F 재반응 필요도 {forward_profile['need_level']} · "
+        f"Q20 {forward_profile['q20_fraction'] * 100:.1f}% · "
+        f"Q20 read-through {forward_profile['readthrough_length']} bp"
+    )
+    reverse_reason = (
+        f"R 재반응 필요도 {reverse_profile['need_level']} · "
+        f"Q20 {reverse_profile['q20_fraction'] * 100:.1f}% · "
+        f"Q20 read-through {reverse_profile['readthrough_length']} bp"
+    )
+
+    return {
+        "recommendation": recommendation,
+        "recommendation_reason": recommendation_reason,
+        "confidence": confidence,
+        "structural_support": structural_support,
+        "forward_profile": forward_profile,
+        "reverse_profile": reverse_profile,
+        "scenarios": [
+            {
+                "name": "F만 재반응",
+                "level": expectation_level(forward_effect),
+                "kind": "benefit",
+                "reason": forward_reason,
+            },
+            {
+                "name": "R만 재반응",
+                "level": expectation_level(reverse_effect),
+                "kind": "benefit",
+                "reason": reverse_reason,
+            },
+            {
+                "name": "양방향 재반응",
+                "level": expectation_level(both_effect),
+                "kind": "benefit",
+                "reason": (
+                    "양쪽 read의 품질 제한을 동시에 보완했을 때의 "
+                    "상대적 기대 효과"
+                ),
+            },
+            {
+                "name": "재반응 후 결합 실패",
+                "level": expectation_level(failure_risk),
+                "kind": "risk",
+                "reason": structural_support["reason"],
+            },
+        ],
+    }
+
+
+# --------------------------------------------------
 # 회사 조건 프리셋 시뮬레이션
 # --------------------------------------------------
 def simulate_company_conditions(
@@ -1032,7 +1682,7 @@ def simulate_company_conditions(
 
         rows.append(
             {
-                "회사 조건": condition_label,
+                "조건": condition_label,
                 "QT": qt_value,
                 "New QT": (
                     "-"
@@ -1185,12 +1835,12 @@ st.divider()
 
 
 # --------------------------------------------------
-# 회사 프로그램 조건 설정
+# 조건 설정
 # --------------------------------------------------
-st.subheader("회사 프로그램 조건 설정")
+st.subheader("조건 설정")
 
 st.caption(
-    "회사에서 실제 사용하는 조건을 개별 프리셋으로 평가합니다. "
+    "실제 분석에 사용하는 조건을 개별 프리셋으로 평가합니다. "
     "30/40과 단독 10도 유효한 독립 조건입니다. 현재 조건별 "
     "출력 유형은 현재 확인된 일곱 AB1 쌍의 실제 결과를 기준으로 "
     "보수적으로 보정되어 있으며, 추가 사례에 따라 갱신해야 "
@@ -1212,7 +1862,7 @@ qt_threshold, new_qt_threshold = parse_company_condition(
 
 with st.expander("조건 시뮬레이터 설정", expanded=False):
     simulation_conditions = st.multiselect(
-        "자동 시험할 회사 조건",
+        "자동 시험할 조건",
         options=COMPANY_CONDITIONS,
         default=COMPANY_CONDITIONS,
     )
@@ -1338,61 +1988,82 @@ if forward_file is not None and reverse_file is not None:
                 selected_condition,
             )
 
-            st.subheader("현재 조건 F/R terminal overlap 분석")
-            st.caption(
-                f"현재 회사 조건: {selected_condition}. "
-                "원본 read를 유지하고 Reverse 원본/"
-                "reverse-complement 및 두 연결 방향을 모두 "
-                "평가했습니다."
-            )
-
-            if overlap_result is None:
-                st.error(
-                    "F와 Reverse-complement R 사이에서 "
-                    "terminal overlap 후보를 찾지 못했습니다."
+            with st.expander(
+                "현재 조건 F/R terminal overlap 분석",
+                expanded=False,
+            ):
+                st.caption(
+                    f"현재 조건: {selected_condition}. "
+                    "원본 read를 유지하고 Reverse 원본/"
+                    "reverse-complement 및 두 연결 방향을 모두 "
+                    "평가했습니다."
                 )
 
-            else:
-                overlap_table = pd.DataFrame(
-                    [
-                        {
-                            "Alignment score": overlap_result[
-                                "score"
-                            ],
-                            "Overlap 염기 수": overlap_result[
-                                "paired_bases"
-                            ],
-                            "Gap 제외 Identity (%)": overlap_result[
-                                "base_identity"
-                            ],
-                            "Gap 포함 Identity (%)": overlap_result[
-                                "gap_included_identity"
-                            ],
-                            "Quality 가중 Identity (%)": overlap_result[
-                                "quality_weighted_identity"
-                            ],
-                            f"Q{qt_threshold} 지지 Match": overlap_result[
-                                "qt_supported_matches"
-                            ],
-                            f"Q{qt_threshold} 최장 연속 Match": overlap_result[
-                                "qt_supported_longest_match_run"
-                            ],
-                            "고품질 Mismatch/Gap": overlap_result[
-                                "qt_supported_conflicts"
-                            ],
-                            "Match": overlap_result["matches"],
-                            "Mismatch": overlap_result["mismatches"],
-                            "Gap": overlap_result["gaps"],
-                        }
-                    ]
-                )
+                if overlap_result is None:
+                    st.error(
+                        "F와 Reverse-complement R 사이에서 "
+                        "terminal overlap 후보를 찾지 못했습니다."
+                    )
+                else:
+                    overlap_table = pd.DataFrame(
+                        [
+                            {
+                                "Alignment score": overlap_result[
+                                    "score"
+                                ],
+                                "Overlap 염기 수": overlap_result[
+                                    "paired_bases"
+                                ],
+                                "Gap 제외 Identity (%)": overlap_result[
+                                    "base_identity"
+                                ],
+                                "Gap 포함 Identity (%)": overlap_result[
+                                    "gap_included_identity"
+                                ],
+                                "Quality 가중 Identity (%)": overlap_result[
+                                    "quality_weighted_identity"
+                                ],
+                                f"Q{qt_threshold} 지지 Match": overlap_result[
+                                    "qt_supported_matches"
+                                ],
+                                f"Q{qt_threshold} 최장 연속 Match": overlap_result[
+                                    "qt_supported_longest_match_run"
+                                ],
+                                "고품질 Mismatch/Gap": overlap_result[
+                                    "qt_supported_conflicts"
+                                ],
+                                "Match": overlap_result["matches"],
+                                "Mismatch": overlap_result["mismatches"],
+                                "Gap": overlap_result["gaps"],
+                            }
+                        ]
+                    )
 
-                st.dataframe(
-                    overlap_table,
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                    st.dataframe(
+                        overlap_table,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
+                    prediction_message = (
+                        f"{current_prediction['status']}: "
+                        f"{current_prediction['reason']}"
+                    )
+
+                    if (
+                        current_prediction["status"]
+                        == "F+R 결합 성공 예상"
+                    ):
+                        st.success(prediction_message)
+                    elif (
+                        current_prediction["status"]
+                        == "Contig2 예상"
+                    ):
+                        st.warning(prediction_message)
+                    else:
+                        st.error(prediction_message)
+
+            if overlap_result is not None:
                 junction_table = pd.DataFrame(
                     [
                         {
@@ -1425,14 +2096,17 @@ if forward_file is not None and reverse_file is not None:
                     ]
                 )
 
-                st.subheader("Junction 경계 평가")
-                st.dataframe(
-                    junction_table,
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                with st.expander(
+                    "Junction 경계 평가",
+                    expanded=False,
+                ):
+                    st.dataframe(
+                        junction_table,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
-                with st.expander("Junction / soft-clip 지표 설명"):
+                with st.expander("지표 설명", expanded=False):
                     st.markdown(
                         """
 - **Junction**은 방향을 맞춘 두 read가 contig로 이어지는 연결 경계입니다.
@@ -1452,28 +2126,14 @@ if forward_file is not None and reverse_file is not None:
                         "결정하지 않습니다."
                     )
 
-                prediction_message = (
-                    f"{current_prediction['status']}: "
-                    f"{current_prediction['reason']}"
-                )
+                    st.caption(
+                        "Gap을 일률적으로 동일 감점하지 않고 해당 "
+                        "염기의 Quality로 가중했습니다. 정렬 밖 "
+                        "junction 염기도 New QT 미만이면 저품질 "
+                        "soft-clip 후보로 취급합니다."
+                    )
 
-                if (
-                    current_prediction["status"]
-                    == "F+R 결합 성공 예상"
-                ):
-                    st.success(prediction_message)
-                elif current_prediction["status"] == "Contig2 예상":
-                    st.warning(prediction_message)
-                else:
-                    st.error(prediction_message)
-
-                st.caption(
-                    "Gap을 일률적으로 동일 감점하지 않고 해당 염기의 "
-                    "Quality로 가중했습니다. 정렬 밖 junction 염기도 "
-                    "New QT 미만이면 저품질 soft-clip 후보로 취급합니다."
-                )
-
-                with st.expander("Alignment 상세 보기"):
+                with st.expander("Alignment 상세 보기", expanded=False):
                     alignment_preview = format_alignment_preview(
                         overlap_result["aligned_left"],
                         overlap_result["markers"],
@@ -1531,7 +2191,7 @@ if forward_file is not None and reverse_file is not None:
 
             if best_simulation is not None:
                 recommendation = (
-                    f"추천 조건: {best_simulation['회사 조건']} · "
+                    f"추천 조건: {best_simulation['조건']} · "
                     f"{best_simulation['Contig 예측']} · "
                     f"{best_simulation['판정 근거']}"
                 )
@@ -1590,7 +2250,7 @@ if forward_file is not None and reverse_file is not None:
                     with card_column:
                         with st.container(border=True):
                             st.markdown(
-                                f"### QT {row['회사 조건']}"
+                                f"### QT {row['조건']}"
                             )
 
                             if (
@@ -1639,6 +2299,157 @@ if forward_file is not None and reverse_file is not None:
                 mime="text/csv",
                 use_container_width=True,
             )
+
+            # ----------------------------------
+            # 재반응 방향 및 기대 효과
+            # ----------------------------------
+            rerun_assessment = evaluate_rerun_scenarios(
+                forward_data,
+                reverse_data,
+                overlap_result,
+                current_prediction,
+                simulation_rows,
+                selected_condition,
+                qt_threshold,
+            )
+
+            st.divider()
+            st.subheader("재반응 시나리오")
+            st.caption(
+                "선택한 현재 조건과 전체 Contig 시뮬레이션 결과를 "
+                "함께 평가합니다. 각 단계는 재반응의 상대적 기대 "
+                "효과이며, 실제 성공 확률을 의미하지 않습니다."
+            )
+
+            recommendation_text = (
+                f"추천: {rerun_assessment['recommendation']} · "
+                f"판단 신뢰도 {rerun_assessment['confidence']} · "
+                f"{rerun_assessment['recommendation_reason']}"
+            )
+
+            if rerun_assessment["recommendation"] == "재반응 불필요":
+                st.success(recommendation_text)
+            elif "조건" in rerun_assessment["recommendation"]:
+                st.info(recommendation_text)
+            elif "효과 낮음" in rerun_assessment["recommendation"]:
+                st.error(recommendation_text)
+            else:
+                st.warning(recommendation_text)
+
+            scenario_columns = st.columns(4)
+
+            for scenario_column, scenario in zip(
+                scenario_columns,
+                rerun_assessment["scenarios"],
+            ):
+                with scenario_column:
+                    with st.container(border=True):
+                        st.markdown(f"#### {scenario['name']}")
+
+                        if scenario["kind"] == "risk":
+                            if scenario["level"] == "높음":
+                                st.error("🔴 높음")
+                            elif scenario["level"] == "중간":
+                                st.warning("🟠 중간")
+                            else:
+                                st.success("🟢 낮음")
+                        else:
+                            if scenario["level"] == "높음":
+                                st.success("🟢 높음")
+                            elif scenario["level"] == "중간":
+                                st.warning("🟠 중간")
+                            else:
+                                st.info("⚪ 낮음")
+
+                        st.caption(scenario["reason"])
+
+            with st.expander(
+                "재반응 판단 근거 상세 보기",
+                expanded=False,
+            ):
+                forward_profile = rerun_assessment[
+                    "forward_profile"
+                ]
+                reverse_profile = rerun_assessment[
+                    "reverse_profile"
+                ]
+                structural_support = rerun_assessment[
+                    "structural_support"
+                ]
+
+                evidence_table = pd.DataFrame(
+                    [
+                        {
+                            "방향": "Forward",
+                            "재반응 필요도": forward_profile[
+                                "need_level"
+                            ],
+                            "평균 Quality": forward_profile[
+                                "average_quality"
+                            ],
+                            "Q20 비율 (%)": round(
+                                forward_profile["q20_fraction"] * 100,
+                                2,
+                            ),
+                            "Q30 비율 (%)": round(
+                                forward_profile["q30_fraction"] * 100,
+                                2,
+                            ),
+                            "Q20 read-through": forward_profile[
+                                "readthrough_length"
+                            ],
+                            "Junction anchor 평균 Q": forward_profile[
+                                "junction_anchor_mean_quality"
+                            ],
+                            "저품질 junction soft-clip": forward_profile[
+                                "junction_low_quality_softclip"
+                            ],
+                        },
+                        {
+                            "방향": "Reverse",
+                            "재반응 필요도": reverse_profile[
+                                "need_level"
+                            ],
+                            "평균 Quality": reverse_profile[
+                                "average_quality"
+                            ],
+                            "Q20 비율 (%)": round(
+                                reverse_profile["q20_fraction"] * 100,
+                                2,
+                            ),
+                            "Q30 비율 (%)": round(
+                                reverse_profile["q30_fraction"] * 100,
+                                2,
+                            ),
+                            "Q20 read-through": reverse_profile[
+                                "readthrough_length"
+                            ],
+                            "Junction anchor 평균 Q": reverse_profile[
+                                "junction_anchor_mean_quality"
+                            ],
+                            "저품질 junction soft-clip": reverse_profile[
+                                "junction_low_quality_softclip"
+                            ],
+                        },
+                    ]
+                )
+
+                st.dataframe(
+                    evidence_table,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.info(
+                    "Overlap 구조 지지: "
+                    f"{structural_support['level']} · "
+                    f"{structural_support['reason']}"
+                )
+                st.caption(
+                    "F/R 방향은 파일명이나 primer 표기가 아니라 "
+                    "Forward/Reverse 업로드 슬롯을 기준으로 표시합니다. "
+                    "한쪽 재반응 후 실제 결과 사례가 누적되면 이 "
+                    "규칙을 추가 보정할 수 있습니다."
+                )
 
             st.divider()
             # 서열 확인
