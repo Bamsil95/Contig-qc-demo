@@ -766,7 +766,19 @@ CONDITION_THRESHOLDS = {
 MIN_DIRECT_30_20_OVERLAP = 70
 MIN_CONTIG2_OVERLAP = 40
 
-# 현재까지 확인된 일곱 AB1 쌍의 실제 결과로 보정한 조건별
+# New QT를 사용하지 않는 QT16 조건은 낮은 품질 말단을 별도로
+# 확장/제외하는 보조 단계가 없습니다. 70 bp 미만의 overlap은 더
+# 엄격한 gap 기준을 만족하는 경우에만 허용하고, 70 bp 이상도 gap
+# 포함 Identity 하한을 적용합니다. MMC(68 bp/gap 4, 실제 미결합)와
+# KCKM1002-4(gap 포함 Identity 87.39%, 실제 미결합) 사례로
+# 보정했습니다.
+MIN_DIRECT_QT16_OVERLAP = 70
+MIN_QT16_GAP_INCLUDED_IDENTITY = 90
+MIN_SHORT_QT16_OVERLAP = 40
+MIN_SHORT_QT16_GAP_INCLUDED_IDENTITY = 94
+MAX_SHORT_QT16_GAPS = 3
+
+# 현재까지 확인된 아홉 AB1 쌍의 실제 결과로 보정한 조건별
 # 출력 유형입니다.
 # 20계열은 terminal overlap이 좋아 보여도 성공으로 자동 승격하지
 # 않고 F/R 개별 출력(Contig2)을 우선합니다.
@@ -814,6 +826,9 @@ def classify_contig_prediction(
         }
 
     overlap_length = overlap_result["paired_bases"]
+    gap_included_identity = overlap_result[
+        "gap_included_identity"
+    ]
     weighted_identity = overlap_result[
         "quality_weighted_identity"
     ]
@@ -1007,11 +1022,31 @@ def classify_contig_prediction(
 
     # 16S 기본값인 QT16 단독 조건입니다. New QT를 사용하지 않고
     # QT16을 말단 품질 경계로 삼아 구조적 overlap을 평가합니다.
-    # 아직 실제 QT16 사례가 충분하지 않으므로 보수적인 임시 기준을
-    # 사용하며, 후속 실제 결과로 계속 보정합니다.
+    # New QT의 말단 보정이 없으므로 70 bp 이상의 직접 overlap과
+    # gap 포함 Identity 90% 이상을 함께 요구합니다. 다만 기존에
+    # 일치했던 짧고 깨끗한 overlap 사례는 gap 포함 Identity 94%
+    # 이상, gap 3개 이하일 때만 별도로 허용합니다.
+    qt16_direct_overlap = (
+        overlap_length >= MIN_DIRECT_QT16_OVERLAP
+        and gap_included_identity
+        >= MIN_QT16_GAP_INCLUDED_IDENTITY
+    )
+
+    qt16_clean_short_overlap = (
+        MIN_SHORT_QT16_OVERLAP
+        <= overlap_length
+        < MIN_DIRECT_QT16_OVERLAP
+        and gap_included_identity
+        >= MIN_SHORT_QT16_GAP_INCLUDED_IDENTITY
+        and overlap_result["gaps"] <= MAX_SHORT_QT16_GAPS
+    )
+
     qt16_only_success = (
         condition_label == "16"
-        and overlap_length >= 40
+        and (
+            qt16_direct_overlap
+            or qt16_clean_short_overlap
+        )
         and overlap_result["base_identity"] >= 97
         and weighted_identity >= 90
         and qt_matches >= 25
@@ -1074,12 +1109,62 @@ def classify_contig_prediction(
         }
 
     if condition_label == "16":
+        qt16_reasons = []
+
+        if overlap_length < MIN_SHORT_QT16_OVERLAP:
+            qt16_reasons.append(
+                f"terminal overlap {overlap_length} bp로 "
+                f"{MIN_SHORT_QT16_OVERLAP} bp 미만"
+            )
+
+        elif overlap_length < MIN_DIRECT_QT16_OVERLAP:
+            short_failures = []
+
+            if (
+                gap_included_identity
+                < MIN_SHORT_QT16_GAP_INCLUDED_IDENTITY
+            ):
+                short_failures.append(
+                    "gap 포함 Identity "
+                    f"{gap_included_identity:.2f}%"
+                )
+
+            if overlap_result["gaps"] > MAX_SHORT_QT16_GAPS:
+                short_failures.append(
+                    f"gap {overlap_result['gaps']}개"
+                )
+
+            if short_failures:
+                qt16_reasons.append(
+                    "70 bp 미만 overlap의 엄격 기준 미충족("
+                    + ", ".join(short_failures)
+                    + ")"
+                )
+
+        if (
+            overlap_length >= MIN_DIRECT_QT16_OVERLAP
+            and
+            gap_included_identity
+            < MIN_QT16_GAP_INCLUDED_IDENTITY
+        ):
+            qt16_reasons.append(
+                "gap 포함 Identity "
+                f"{gap_included_identity:.2f}%로 "
+                f"{MIN_QT16_GAP_INCLUDED_IDENTITY}% 미만"
+            )
+
+        if not qt16_reasons:
+            qt16_reasons.append(
+                "QT16 직접 결합용 Quality/junction 기준 미충족"
+            )
+
         return {
             "status": "Contig2 예상",
             "rank": 1,
             "reason": (
-                "QT16 단독 조건에서 overlap 후보는 있으나 직접 "
-                "결합 기준 미충족; 실제 QT16 사례 추가 보정 필요"
+                "QT16 단독 조건에서 overlap 후보는 있으나 "
+                + "; ".join(qt16_reasons)
+                + "; F/R 개별 출력 예상"
             ),
         }
 
@@ -1894,11 +1979,11 @@ st.caption(
     "실제 분석에 사용하는 조건을 개별 프리셋으로 평가합니다. "
     "16과 20은 New QT를 사용하지 않는 단독 QT 조건이며, "
     "30/40과 단독 10도 유효한 독립 조건입니다. 현재 조건별 "
-    "출력 유형은 현재 확인된 일곱 AB1 쌍의 실제 결과를 기준으로 "
+    "출력 유형은 현재 확인된 아홉 AB1 쌍의 실제 결과를 기준으로 "
     "보수적으로 보정되어 있으며, 추가 사례에 따라 갱신해야 "
     "합니다. 20계열의 좋은 junction은 성공을 확정하지 않고 "
-    "Contig2를 우선합니다. QT16 결과는 아직 실제 보정 사례가 "
-    "부족해 구조적 기준으로 우선 평가합니다. "
+    "Contig2를 우선합니다. QT16은 New QT 미사용 조건이므로 "
+    "짧은 overlap과 gap이 많은 정렬을 보수적으로 평가합니다. "
     "Primer 파일명은 판정에 사용하지 않고 Reverse 원본과 "
     "reverse-complement를 모두 비교해 정렬 방향을 선택합니다."
 )
@@ -2226,9 +2311,9 @@ if forward_file is not None and reverse_file is not None:
                 "동일한 AB1 쌍을 각 QT 조건으로 평가한 결과입니다. "
                 "카드는 F+R 결합 성공 예상, Contig2 예상, "
                 "No contig 예상 순으로 표시합니다. 판정은 현재까지 "
-                "확인된 일곱 AB1 쌍의 실제 결과로 보정했습니다. "
-                "QT16은 실제 사례가 누적되기 전까지 구조 기반 "
-                "임시 판정입니다."
+                "확인된 아홉 AB1 쌍의 실제 결과로 보정했습니다. "
+                "QT16은 New QT 미사용 조건으로, 최소 terminal "
+                "overlap과 gap 포함 Identity를 함께 평가합니다."
             )
 
             simulation_display_rows = [
