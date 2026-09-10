@@ -778,7 +778,7 @@ MIN_SHORT_QT16_OVERLAP = 40
 MIN_SHORT_QT16_GAP_INCLUDED_IDENTITY = 94
 MAX_SHORT_QT16_GAPS = 3
 
-# 현재까지 확인된 아홉 AB1 쌍의 실제 결과로 보정한 조건별
+# 현재까지 확인된 열한 AB1 쌍의 실제 결과로 보정한 조건별
 # 출력 유형입니다.
 # 20계열은 terminal overlap이 좋아 보여도 성공으로 자동 승격하지
 # 않고 F/R 개별 출력(Contig2)을 우선합니다.
@@ -826,6 +826,77 @@ def standard_condition_label(qt_value, new_qt_value):
     )
 
 
+def deep_internal_overlap_mode(
+    overlap_result,
+    qt_threshold,
+    new_qt_threshold,
+):
+    """
+    두 read 말단에 긴 read-through가 남아 있지만 내부에 매우 강한
+    overlap이 있는 유형을 판별합니다. Primer명이 아니라 정렬 구조와
+    junction anchor 품질만 사용합니다.
+    """
+
+    if overlap_result is None or new_qt_threshold is None:
+        return None
+
+    qt_matches = overlap_result["qt_supported_matches"]
+    qt_conflicts = overlap_result["qt_supported_conflicts"]
+    longest_run = overlap_result[
+        "qt_supported_longest_match_run"
+    ]
+    forward_softclip = overlap_result[
+        "forward_junction_softclip"
+    ]
+    reverse_softclip = overlap_result[
+        "reverse_junction_softclip"
+    ]
+    minimum_anchor_quality = min(
+        overlap_result["forward_junction_anchor_mean_quality"],
+        overlap_result["reverse_junction_anchor_mean_quality"],
+    )
+
+    strong_internal_structure = (
+        overlap_result["paired_bases"] >= 250
+        and overlap_result["base_identity"] >= 98
+        and overlap_result["gap_included_identity"] >= 94
+        and overlap_result["quality_weighted_identity"] >= 96
+        and overlap_result["gap_rate"] <= 5
+        and qt_matches >= 180
+        and qt_conflicts <= max(15, int(qt_matches * 0.08))
+        and 200 <= forward_softclip <= 500
+        and 200 <= reverse_softclip <= 500
+        and overlap_result["terminal_slack_total"] <= 900
+        and overlap_result.get("reverse_orientation")
+        == "Reverse-complement 적용"
+    )
+
+    if not strong_internal_structure:
+        return None
+
+    # WT-M13처럼 junction anchor가 매우 깨끗하면 QT20/New QT10의
+    # 긴 연속 match로 내부 overlap을 사용할 수 있습니다.
+    if (
+        20 <= qt_threshold < 25
+        and 10 <= new_qt_threshold <= 12
+        and minimum_anchor_quality >= 38
+        and longest_run >= 35
+    ):
+        return "고품질 장거리 내부 overlap"
+
+    # A-B21-M13처럼 anchor 품질이 상대적으로 낮으면 QT를 높여
+    # 노이즈를 억제한 조건에서 충분한 연속 match가 남아야 합니다.
+    if (
+        25 <= qt_threshold <= 30
+        and 15 <= new_qt_threshold <= 25
+        and minimum_anchor_quality >= 30
+        and longest_run >= 20
+    ):
+        return "고QT 장거리 내부 overlap"
+
+    return None
+
+
 # --------------------------------------------------
 # Contig 생성 결과 판정
 # --------------------------------------------------
@@ -866,6 +937,11 @@ def classify_contig_prediction(
     low_quality_fraction = overlap_result[
         "terminal_low_quality_fraction"
     ]
+    internal_overlap_mode = deep_internal_overlap_mode(
+        overlap_result,
+        qt_threshold,
+        new_qt_threshold,
+    )
     new_qt_enabled = new_qt_threshold is not None
     boundary_label = (
         f"New QT {new_qt_threshold}"
@@ -895,13 +971,14 @@ def classify_contig_prediction(
             f"고품질 mismatch/gap {qt_conflicts}개"
         )
 
-    if total_slack > 350:
+    if total_slack > 350 and internal_overlap_mode is None:
         structural_fail_reasons.append(
             f"junction soft-clip 후보 {total_slack} bp 초과"
         )
 
     if (
         new_qt_enabled
+        and internal_overlap_mode is None
         and terminal_high_quality
         > max(100, int(overlap_length * 0.75))
     ):
@@ -997,9 +1074,19 @@ def classify_contig_prediction(
     if (
         condition_label == "30/20"
         and reverse_orientation == "Reverse-complement 적용"
-        and (direct_30_20_success or low_quality_terminal_rescue)
+        and (
+            direct_30_20_success
+            or low_quality_terminal_rescue
+            or internal_overlap_mode is not None
+        )
     ):
-        if low_quality_terminal_rescue:
+        if internal_overlap_mode is not None:
+            success_basis = (
+                f"30/20 {internal_overlap_mode} 성공 패턴 충족; "
+                f"Q{qt_threshold} 최장 연속 match "
+                f"{qt_longest_match_run} bp"
+            )
+        elif low_quality_terminal_rescue:
             success_basis = (
                 "30/20 저품질 말단 soft-clip 성공 패턴 충족; "
                 f"말단 저품질 비율 {low_quality_fraction * 100:.1f}%"
@@ -1039,6 +1126,24 @@ def classify_contig_prediction(
                 "30/20 정렬 근거는 있으나 terminal overlap "
                 f"{overlap_length} bp로 {MIN_DIRECT_30_20_OVERLAP} "
                 "bp 미만; F/R 개별 출력 보정 패턴"
+            ),
+        }
+
+    # 긴 read-through가 양쪽에 남은 read 쌍에서 내부 overlap이
+    # 매우 강하고 junction anchor가 깨끗한 경우입니다. WT-M13의
+    # 실제 20/10 성공 사례로 보정했지만 primer명은 사용하지 않아
+    # 같은 구조의 다른 서비스에도 적용됩니다.
+    if (
+        condition_label == "20/10"
+        and internal_overlap_mode is not None
+    ):
+        return {
+            "status": "F+R 결합 성공 예상",
+            "rank": 2,
+            "reason": (
+                f"20/10 {internal_overlap_mode} 성공 패턴 충족; "
+                f"Q{qt_threshold} 최장 연속 match "
+                f"{qt_longest_match_run} bp"
             ),
         }
 
@@ -1284,6 +1389,11 @@ def classify_exploratory_prediction(
     low_quality_fraction = overlap_result[
         "terminal_low_quality_fraction"
     ]
+    internal_overlap_mode = deep_internal_overlap_mode(
+        overlap_result,
+        qt_threshold,
+        new_qt_threshold,
+    )
 
     hard_failures = []
 
@@ -1303,7 +1413,7 @@ def classify_exploratory_prediction(
             f"고품질 mismatch/gap {conflicts}개"
         )
 
-    if terminal_slack > 350:
+    if terminal_slack > 350 and internal_overlap_mode is None:
         hard_failures.append(
             f"junction soft-clip {terminal_slack} bp 초과"
         )
@@ -1364,8 +1474,15 @@ def classify_exploratory_prediction(
         direct_success
         or clean_short_success
         or low_quality_terminal_rescue
+        or internal_overlap_mode is not None
     ):
-        if low_quality_terminal_rescue:
+        if internal_overlap_mode is not None:
+            success_reason = (
+                f"확장 조건의 {internal_overlap_mode} 충족; "
+                f"Q{qt_threshold} 최장 연속 match "
+                f"{longest_run} bp"
+            )
+        elif low_quality_terminal_rescue:
             success_reason = (
                 "확장 조건의 저품질 말단 제외 패턴 충족; "
                 f"soft-clip 저품질 비율 "
@@ -2371,7 +2488,7 @@ st.caption(
     "실제 분석에 사용하는 조건을 개별 프리셋으로 평가합니다. "
     "16과 20은 New QT를 사용하지 않는 단독 QT 조건이며, "
     "30/40과 단독 10도 유효한 독립 조건입니다. 현재 조건별 "
-    "출력 유형은 현재 확인된 아홉 AB1 쌍의 실제 결과를 기준으로 "
+    "출력 유형은 현재 확인된 열한 AB1 쌍의 실제 결과를 기준으로 "
     "보수적으로 보정되어 있으며, 추가 사례에 따라 갱신해야 "
     "합니다. 20계열의 좋은 junction은 성공을 확정하지 않고 "
     "Contig2를 우선합니다. QT16은 New QT 미사용 조건이므로 "
@@ -2667,6 +2784,7 @@ if forward_file is not None and reverse_file is not None:
 - **경계 기준 이상 soft-clip 염기**는 제외 후보 중 현재 품질 경계 이상인 염기 수입니다. New QT 사용 조건에서는 New QT, 미사용 조건에서는 QT가 경계가 됩니다. 값이 크면 신뢰도 높은 서열을 많이 버려야 하므로 불리합니다.
 - **Soft-clip 저품질 비율**은 제외 후보 중 현재 품질 경계 미만 염기의 비율입니다. 높을수록 말단 제외가 합리적이라는 보조 근거입니다.
 - **QT 최장 연속 Match**는 양쪽 염기가 모두 현재 QT 이상이면서 정확히 일치하는 구간 중 가장 긴 연속 길이입니다. QT 지지 Match 총량이 많아도 이 값이 짧으면 고품질 anchor가 여러 조각으로 끊긴 상태입니다.
+- **장거리 내부 overlap**은 양쪽 read 끝에 긴 read-through가 남아도 내부에서 250 bp 이상의 강하고 연속적인 overlap이 확인되는 유형입니다. Primer명과 무관하게 평가하며, 일반 terminal overlap보다 엄격한 Identity·gap·anchor 기준을 적용합니다.
                         """
                     )
                     st.info(
@@ -2725,7 +2843,7 @@ if forward_file is not None and reverse_file is not None:
             st.caption(
                 "지정 범위에서 성공 가능 조건을 찾고, 인접 QT/New "
                 "QT에서도 결과가 유지되는지 평가합니다. 표준 조건은 "
-                "확인된 아홉 AB1 쌍의 실제 결과로 보정했으며, 확장 "
+                "확인된 열한 AB1 쌍의 실제 결과로 보정했으며, 확장 "
                 "조건은 구조 기반 탐색 후보입니다."
             )
 
