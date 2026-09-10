@@ -794,6 +794,11 @@ NO_CONTIG_CALIBRATED_CONDITIONS = {
     "30/40",
 }
 
+STANDARD_CONDITION_BY_VALUES = {
+    thresholds: label
+    for label, thresholds in CONDITION_THRESHOLDS.items()
+}
+
 
 def parse_company_condition(condition_label):
     if condition_label not in CONDITION_THRESHOLDS:
@@ -802,6 +807,23 @@ def parse_company_condition(condition_label):
         )
 
     return CONDITION_THRESHOLDS[condition_label]
+
+
+def format_condition_label(qt_value, new_qt_value):
+    """내부 New QT 미사용값(None)은 화면에서 QT만 표시합니다."""
+
+    if new_qt_value is None:
+        return str(qt_value)
+
+    return f"{qt_value}/{new_qt_value}"
+
+
+def standard_condition_label(qt_value, new_qt_value):
+    """현재 실제 결과로 보정된 표준 조건명을 반환합니다."""
+
+    return STANDARD_CONDITION_BY_VALUES.get(
+        (qt_value, new_qt_value)
+    )
 
 
 # --------------------------------------------------
@@ -1222,6 +1244,174 @@ def classify_contig_prediction(
         "status": "No contig 예상",
         "rank": 0,
         "reason": "; ".join(no_contig_reasons),
+    }
+
+
+def classify_exploratory_prediction(
+    overlap_result,
+    qt_threshold,
+    new_qt_threshold,
+):
+    """
+    실제 결과로 직접 보정되지 않은 확장 QT 조합을 구조적으로
+    평가합니다. 단일 지표가 아니라 overlap, gap 포함 Identity,
+    Quality anchor, junction을 모두 통과해야 성공 후보가 됩니다.
+    """
+
+    if overlap_result is None:
+        return {
+            "status": "No contig 예상",
+            "rank": 0,
+            "reason": "terminal overlap 후보를 찾지 못함",
+        }
+
+    overlap_length = overlap_result["paired_bases"]
+    base_identity = overlap_result["base_identity"]
+    gap_identity = overlap_result["gap_included_identity"]
+    weighted_identity = overlap_result[
+        "quality_weighted_identity"
+    ]
+    qt_matches = overlap_result["qt_supported_matches"]
+    longest_run = overlap_result[
+        "qt_supported_longest_match_run"
+    ]
+    conflicts = overlap_result["qt_supported_conflicts"]
+    gaps = overlap_result["gaps"]
+    terminal_slack = overlap_result["terminal_slack_total"]
+    terminal_high_quality = overlap_result[
+        "terminal_high_quality_bases"
+    ]
+    low_quality_fraction = overlap_result[
+        "terminal_low_quality_fraction"
+    ]
+
+    hard_failures = []
+
+    if overlap_length < 20:
+        hard_failures.append("overlap 20 bp 미만")
+
+    if weighted_identity < 82:
+        hard_failures.append("Quality 가중 Identity 82% 미만")
+
+    if qt_matches < 10:
+        hard_failures.append(
+            f"Q{qt_threshold} 지지 match 10 bp 미만"
+        )
+
+    if conflicts > max(25, int(qt_matches * 0.45)):
+        hard_failures.append(
+            f"고품질 mismatch/gap {conflicts}개"
+        )
+
+    if terminal_slack > 350:
+        hard_failures.append(
+            f"junction soft-clip {terminal_slack} bp 초과"
+        )
+
+    if hard_failures:
+        return {
+            "status": "No contig 예상",
+            "rank": 0,
+            "reason": "; ".join(hard_failures),
+        }
+
+    terminal_pass = (
+        terminal_high_quality <= 30
+        and (
+            terminal_slack <= 20
+            or low_quality_fraction >= 0.65
+        )
+    )
+
+    direct_success = (
+        overlap_length >= 70
+        and base_identity >= 97
+        and gap_identity >= 90
+        and weighted_identity >= 92
+        and qt_matches >= 25
+        and longest_run >= 8
+        and conflicts <= max(8, int(qt_matches * 0.15))
+        and terminal_pass
+    )
+
+    clean_short_success = (
+        40 <= overlap_length < 70
+        and base_identity >= 98
+        and gap_identity >= 94
+        and weighted_identity >= 95
+        and gaps <= 3
+        and qt_matches >= 25
+        and longest_run >= 10
+        and terminal_high_quality <= 10
+        and terminal_slack <= 30
+    )
+
+    low_quality_terminal_rescue = (
+        new_qt_threshold is not None
+        and overlap_length >= 200
+        and base_identity >= 98
+        and gap_identity >= 88
+        and weighted_identity >= 92
+        and qt_matches >= 50
+        and longest_run >= 8
+        and conflicts <= max(8, int(qt_matches * 0.15))
+        and 60 <= terminal_slack <= 180
+        and terminal_high_quality <= 30
+        and low_quality_fraction >= 0.70
+    )
+
+    if (
+        direct_success
+        or clean_short_success
+        or low_quality_terminal_rescue
+    ):
+        if low_quality_terminal_rescue:
+            success_reason = (
+                "확장 조건의 저품질 말단 제외 패턴 충족; "
+                f"soft-clip 저품질 비율 "
+                f"{low_quality_fraction * 100:.1f}%"
+            )
+        elif clean_short_success:
+            success_reason = (
+                "짧지만 gap이 적은 terminal overlap 충족; "
+                f"gap 포함 Identity {gap_identity:.2f}%"
+            )
+        else:
+            success_reason = (
+                "확장 조건의 직접 terminal overlap 충족; "
+                f"Q{qt_threshold} 최장 연속 match "
+                f"{longest_run} bp"
+            )
+
+        return {
+            "status": "F+R 결합 성공 예상",
+            "rank": 2,
+            "reason": success_reason,
+        }
+
+    contig2_candidate = (
+        overlap_length >= 40
+        and base_identity >= 95
+        and weighted_identity >= 85
+        and qt_matches >= 15
+    )
+
+    if contig2_candidate:
+        return {
+            "status": "Contig2 예상",
+            "rank": 1,
+            "reason": (
+                "overlap 후보는 있으나 확장 조건의 직접 결합 기준 "
+                "또는 인접 조건 안정성 확인 필요"
+            ),
+        }
+
+    return {
+        "status": "No contig 예상",
+        "rank": 0,
+        "reason": (
+            "확장 조건에서 안정적인 terminal overlap 근거 부족"
+        ),
     }
 
 
@@ -1762,125 +1952,146 @@ def evaluate_rerun_scenarios(
 
 
 # --------------------------------------------------
-# 회사 조건 프리셋 시뮬레이션
+# 조건 시뮬레이션 및 범위 탐색
 # --------------------------------------------------
-def simulate_company_conditions(
+def empty_overlap_result():
+    return {
+        "paired_bases": 0,
+        "base_identity": 0,
+        "gap_included_identity": 0,
+        "quality_weighted_identity": 0,
+        "gaps": 0,
+        "qt_supported_matches": 0,
+        "qt_supported_longest_match_run": 0,
+        "qt_supported_conflicts": 0,
+        "connection_direction": "-",
+        "reverse_orientation": "-",
+        "left_tail_unaligned": None,
+        "right_head_unaligned": None,
+        "terminal_high_quality_bases": None,
+        "terminal_low_quality_fraction": 0,
+    }
+
+
+def evaluate_condition_values(
     forward_data,
     reverse_data,
-    condition_labels,
+    qt_value,
+    current_new_qt,
 ):
-    rows = []
+    calibrated_label = standard_condition_label(
+        qt_value,
+        current_new_qt,
+    )
+    condition_label = (
+        calibrated_label
+        if calibrated_label is not None
+        else format_condition_label(qt_value, current_new_qt)
+    )
 
-    unique_conditions = [
-        condition
-        for condition in COMPANY_CONDITIONS
-        if condition in set(condition_labels)
-    ]
+    overlap_result = analyze_best_reverse_orientation(
+        forward_data["sequence"],
+        forward_data["quality_scores"],
+        reverse_data["sequence"],
+        reverse_data["quality_scores"],
+        qt_value,
+        current_new_qt,
+    )
 
-    for condition_label in unique_conditions:
-        qt_value, current_new_qt = parse_company_condition(
-            condition_label
-        )
-
-        overlap_result = analyze_best_reverse_orientation(
-            forward_data["sequence"],
-            forward_data["quality_scores"],
-            reverse_data["sequence"],
-            reverse_data["quality_scores"],
-            qt_value,
-            current_new_qt,
-        )
-
+    if calibrated_label is not None:
         prediction = classify_contig_prediction(
             overlap_result,
             qt_value,
             current_new_qt,
-            condition_label,
+            calibrated_label,
+        )
+        condition_type = "표준"
+        condition_order = COMPANY_CONDITIONS.index(
+            calibrated_label
+        )
+    else:
+        prediction = classify_exploratory_prediction(
+            overlap_result,
+            qt_value,
+            current_new_qt,
+        )
+        condition_type = "확장"
+        condition_order = 1000 + qt_value * 100 + (
+            -1 if current_new_qt is None else current_new_qt
         )
 
-        if overlap_result is None:
-            overlap_result = {
-                "paired_bases": 0,
-                "base_identity": 0,
-                "gap_included_identity": 0,
-                "quality_weighted_identity": 0,
-                "gaps": 0,
-                "qt_supported_matches": 0,
-                "qt_supported_longest_match_run": 0,
-                "qt_supported_conflicts": 0,
-                "connection_direction": "-",
-                "reverse_orientation": "-",
-                "left_tail_unaligned": None,
-                "right_head_unaligned": None,
-                "terminal_high_quality_bases": None,
-                "terminal_low_quality_fraction": 0,
-            }
+    safe_overlap = (
+        overlap_result
+        if overlap_result is not None
+        else empty_overlap_result()
+    )
 
-        rows.append(
-            {
-                "조건": condition_label,
-                "QT": qt_value,
-                "New QT": (
-                    "-"
-                    if current_new_qt is None
-                    else str(current_new_qt)
-                ),
-                "Overlap": overlap_result["paired_bases"],
-                "Gap 제외 Identity (%)": overlap_result[
-                    "base_identity"
-                ],
-                "Gap 포함 Identity (%)": overlap_result[
-                    "gap_included_identity"
-                ],
-                "Quality 가중 Identity (%)": overlap_result[
-                    "quality_weighted_identity"
-                ],
-                "QT 지지 Match": overlap_result[
-                    "qt_supported_matches"
-                ],
-                "QT 최장 연속 Match": overlap_result[
-                    "qt_supported_longest_match_run"
-                ],
-                "고품질 Mismatch/Gap": overlap_result[
-                    "qt_supported_conflicts"
-                ],
-                "Gap": overlap_result["gaps"],
-                "연결 방향": overlap_result[
-                    "connection_direction"
-                ],
-                "Reverse 처리": overlap_result[
-                    "reverse_orientation"
-                ],
-                "왼쪽 junction soft-clip": overlap_result[
-                    "left_tail_unaligned"
-                ],
-                "오른쪽 junction soft-clip": overlap_result[
-                    "right_head_unaligned"
-                ],
-                "경계 기준 이상 soft-clip 염기": overlap_result[
-                    "terminal_high_quality_bases"
-                ],
-                "soft-clip 저품질 비율 (%)": round(
-                    overlap_result[
-                        "terminal_low_quality_fraction"
-                    ]
-                    * 100,
-                    2,
-                ),
-                "Contig 예측": prediction["status"],
-                "판정 근거": prediction["reason"],
-                "_rank": prediction["rank"],
-                "_condition_order": COMPANY_CONDITIONS.index(
-                    condition_label
-                ),
-            }
-        )
+    return {
+        "조건": condition_label,
+        "조건 유형": condition_type,
+        "QT": qt_value,
+        "New QT": (
+            "미사용"
+            if current_new_qt is None
+            else str(current_new_qt)
+        ),
+        "Overlap": safe_overlap["paired_bases"],
+        "Gap 제외 Identity (%)": safe_overlap["base_identity"],
+        "Gap 포함 Identity (%)": safe_overlap[
+            "gap_included_identity"
+        ],
+        "Quality 가중 Identity (%)": safe_overlap[
+            "quality_weighted_identity"
+        ],
+        "QT 지지 Match": safe_overlap[
+            "qt_supported_matches"
+        ],
+        "QT 최장 연속 Match": safe_overlap[
+            "qt_supported_longest_match_run"
+        ],
+        "고품질 Mismatch/Gap": safe_overlap[
+            "qt_supported_conflicts"
+        ],
+        "Gap": safe_overlap["gaps"],
+        "연결 방향": safe_overlap["connection_direction"],
+        "Reverse 처리": safe_overlap["reverse_orientation"],
+        "왼쪽 junction soft-clip": safe_overlap[
+            "left_tail_unaligned"
+        ],
+        "오른쪽 junction soft-clip": safe_overlap[
+            "right_head_unaligned"
+        ],
+        "경계 기준 이상 soft-clip 염기": safe_overlap[
+            "terminal_high_quality_bases"
+        ],
+        "soft-clip 저품질 비율 (%)": round(
+            safe_overlap["terminal_low_quality_fraction"] * 100,
+            2,
+        ),
+        "Contig 예측": prediction["status"],
+        "인접 성공": "-",
+        "추천 안정성": "-",
+        "판정 근거": prediction["reason"],
+        "_rank": prediction["rank"],
+        "_condition_order": condition_order,
+        "_qt_value": qt_value,
+        "_new_qt_value": current_new_qt,
+        "_standard": calibrated_label is not None,
+        "_neighbor_success": 0,
+        "_neighbor_total": 0,
+        "_stability_rank": 0,
+    }
 
+
+def sort_simulation_rows(rows):
     return sorted(
         rows,
         key=lambda row: (
             -row["_rank"],
+            -int(row.get("_standard", False)),
+            -row.get("_stability_rank", 0),
             -row["Quality 가중 Identity (%)"],
+            -row["Gap 포함 Identity (%)"],
             -row["QT 지지 Match"],
             row["경계 기준 이상 soft-clip 염기"]
             if row["경계 기준 이상 soft-clip 염기"] is not None
@@ -1891,26 +2102,205 @@ def simulate_company_conditions(
     )
 
 
+def simulate_company_conditions(
+    forward_data,
+    reverse_data,
+    condition_labels,
+):
+    rows = []
+    requested = set(condition_labels)
+
+    for condition_label in COMPANY_CONDITIONS:
+        if condition_label not in requested:
+            continue
+
+        qt_value, current_new_qt = parse_company_condition(
+            condition_label
+        )
+        rows.append(
+            evaluate_condition_values(
+                forward_data,
+                reverse_data,
+                qt_value,
+                current_new_qt,
+            )
+        )
+
+    return sort_simulation_rows(rows)
+
+
+def inclusive_range(start, end, step):
+    values = list(range(start, end + 1, step))
+
+    if values[-1] != end:
+        values.append(end)
+
+    return values
+
+
+def annotate_neighbor_stability(rows):
+    for row in rows:
+        if row["_rank"] != 2:
+            continue
+
+        neighbors = []
+        row_new_qt = row["_new_qt_value"]
+
+        for candidate in rows:
+            if candidate is row:
+                continue
+
+            if abs(candidate["_qt_value"] - row["_qt_value"]) > 1:
+                continue
+
+            candidate_new_qt = candidate["_new_qt_value"]
+
+            if row_new_qt is None or candidate_new_qt is None:
+                if row_new_qt is not None or candidate_new_qt is not None:
+                    continue
+            elif abs(candidate_new_qt - row_new_qt) > 2:
+                continue
+
+            neighbors.append(candidate)
+
+        neighbor_success = sum(
+            candidate["_rank"] == 2
+            for candidate in neighbors
+        )
+        neighbor_total = len(neighbors)
+        stability_ratio = (
+            neighbor_success / neighbor_total
+            if neighbor_total
+            else 0
+        )
+
+        if neighbor_success >= 3 and stability_ratio >= 0.60:
+            stability_label = "높음"
+            stability_rank = 2
+        elif neighbor_success >= 1 and stability_ratio >= 0.35:
+            stability_label = "중간"
+            stability_rank = 1
+        else:
+            stability_label = "낮음"
+            stability_rank = 0
+
+        row["_neighbor_success"] = neighbor_success
+        row["_neighbor_total"] = neighbor_total
+        row["_stability_rank"] = stability_rank
+        row["인접 성공"] = (
+            f"{neighbor_success}/{neighbor_total}"
+            if neighbor_total
+            else "0/0"
+        )
+        row["추천 안정성"] = stability_label
+
+    return rows
+
+
+def simulate_condition_range(
+    forward_data,
+    reverse_data,
+    qt_min,
+    qt_max,
+    new_qt_min,
+    new_qt_max,
+    include_qt_only=True,
+    selected_condition=None,
+):
+    """
+    넓은 범위는 QT 2/New QT 5 단위로 먼저 검색하고, 상위 세
+    후보 주변을 QT 1/New QT 1 단위로 다시 계산합니다.
+    """
+
+    coarse_qt_values = set(inclusive_range(qt_min, qt_max, 2))
+    coarse_new_qt_values = set(
+        inclusive_range(new_qt_min, new_qt_max, 5)
+    )
+
+    for standard_qt, standard_new_qt in CONDITION_THRESHOLDS.values():
+        if qt_min <= standard_qt <= qt_max:
+            coarse_qt_values.add(standard_qt)
+
+        if (
+            standard_new_qt is not None
+            and new_qt_min <= standard_new_qt <= new_qt_max
+        ):
+            coarse_new_qt_values.add(standard_new_qt)
+
+    condition_specs = set()
+
+    for qt_value in sorted(coarse_qt_values):
+        if include_qt_only:
+            condition_specs.add((qt_value, None))
+
+        for current_new_qt in sorted(coarse_new_qt_values):
+            condition_specs.add((qt_value, current_new_qt))
+
+    if selected_condition in CONDITION_THRESHOLDS:
+        selected_values = CONDITION_THRESHOLDS[selected_condition]
+        condition_specs.add(selected_values)
+
+    rows_by_values = {}
+
+    def evaluate_specs(specs):
+        for qt_value, current_new_qt in sorted(
+            specs,
+            key=lambda spec: (
+                spec[0],
+                -1 if spec[1] is None else spec[1],
+            ),
+        ):
+            key = (qt_value, current_new_qt)
+
+            if key in rows_by_values:
+                continue
+
+            rows_by_values[key] = evaluate_condition_values(
+                forward_data,
+                reverse_data,
+                qt_value,
+                current_new_qt,
+            )
+
+    evaluate_specs(condition_specs)
+
+    coarse_rows = sort_simulation_rows(
+        list(rows_by_values.values())
+    )
+    seed_rows = coarse_rows[:3]
+    fine_specs = set()
+
+    for seed in seed_rows:
+        seed_qt = seed["_qt_value"]
+        seed_new_qt = seed["_new_qt_value"]
+
+        for qt_value in range(
+            max(qt_min, seed_qt - 1),
+            min(qt_max, seed_qt + 1) + 1,
+        ):
+            if seed_new_qt is None:
+                if include_qt_only:
+                    fine_specs.add((qt_value, None))
+                continue
+
+            for current_new_qt in range(
+                max(new_qt_min, seed_new_qt - 2),
+                min(new_qt_max, seed_new_qt + 2) + 1,
+            ):
+                fine_specs.add((qt_value, current_new_qt))
+
+    evaluate_specs(fine_specs)
+
+    rows = list(rows_by_values.values())
+    annotate_neighbor_stability(rows)
+    return sort_simulation_rows(rows)
+
+
 def choose_best_simulation(simulation_rows):
     if not simulation_rows:
         return None
 
-    return max(
-        simulation_rows,
-        key=lambda row: (
-            row["_rank"],
-            row["Quality 가중 Identity (%)"],
-            row["QT 지지 Match"],
-            -(
-                row["경계 기준 이상 soft-clip 염기"]
-                if row["경계 기준 이상 soft-clip 염기"]
-                is not None
-                else 10**9
-            ),
-            row["Overlap"],
-            -row["_condition_order"],
-        ),
-    )
+    return sort_simulation_rows(simulation_rows)[0]
 
 
 # --------------------------------------------------
@@ -1963,7 +2353,9 @@ st.write(
     """
     Forward와 Reverse AB1 파일의 염기서열과 Quality를 읽고,
     원본 read를 유지한 채 Quality 가중 terminal overlap과
-    junction soft-clipping 가능성을 평가합니다.
+    junction soft-clipping 가능성을 평가합니다. Primer명과 무관하게
+    16S, ITS, M13F/M13R처럼 서로 마주 보는 read 쌍을 사용할 수
+    있습니다.
     """
 )
 
@@ -1999,16 +2391,37 @@ qt_threshold, new_qt_threshold = parse_company_condition(
 )
 
 with st.expander("조건 시뮬레이터 설정", expanded=False):
-    simulation_conditions = st.multiselect(
-        "자동 시험할 조건",
-        options=COMPANY_CONDITIONS,
-        default=COMPANY_CONDITIONS,
+    qt_search_range = st.slider(
+        "QT 탐색 범위",
+        min_value=10,
+        max_value=30,
+        value=(10, 30),
+        step=1,
+    )
+
+    new_qt_search_range = st.slider(
+        "New QT 탐색 범위",
+        min_value=10,
+        max_value=40,
+        value=(10, 40),
+        step=1,
+    )
+
+    include_qt_only = st.checkbox(
+        "New QT 미사용 조건도 탐색",
+        value=True,
+        help=(
+            "QT만 사용하는 16, 20 등의 조건을 숫자 0과 구분해 "
+            "별도 평가합니다."
+        ),
     )
 
     st.caption(
-        "선택한 조건을 모두 분석하고, 현재 조건은 목록에 없어도 "
-        "자동으로 포함합니다. 결과는 F+R 결합 성공 예상 → "
-        "Contig2 예상 → No contig 예상 순으로 정렬됩니다."
+        "지정 범위를 먼저 QT 2/New QT 5 단위로 탐색한 뒤 상위 "
+        "후보 주변을 1단위로 정밀 분석합니다. 표준 조건은 실제 "
+        "사례 보정값을 유지하고, 그 외 값은 확장 조건으로 "
+        "표시합니다. 선택한 현재 조건은 범위 밖이어도 비교를 위해 "
+        "자동 포함합니다."
     )
 
 st.divider()
@@ -2286,20 +2699,22 @@ if forward_file is not None and reverse_file is not None:
                     )
 
             # ----------------------------------
-            # 회사 조건 프리셋 전체 시뮬레이션
+            # QT / New QT 범위 탐색
             # ----------------------------------
-            conditions_to_simulate = list(
-                dict.fromkeys(
-                    simulation_conditions
-                    + [selected_condition]
+            with st.spinner(
+                "QT/New QT 범위를 탐색하고 상위 후보를 "
+                "정밀 분석하고 있습니다..."
+            ):
+                simulation_rows = simulate_condition_range(
+                    forward_data,
+                    reverse_data,
+                    qt_search_range[0],
+                    qt_search_range[1],
+                    new_qt_search_range[0],
+                    new_qt_search_range[1],
+                    include_qt_only=include_qt_only,
+                    selected_condition=selected_condition,
                 )
-            )
-
-            simulation_rows = simulate_company_conditions(
-                forward_data,
-                reverse_data,
-                conditions_to_simulate,
-            )
 
             best_simulation = choose_best_simulation(
                 simulation_rows
@@ -2308,12 +2723,10 @@ if forward_file is not None and reverse_file is not None:
             st.divider()
             st.subheader("Contig 시뮬레이션 결과")
             st.caption(
-                "동일한 AB1 쌍을 각 QT 조건으로 평가한 결과입니다. "
-                "카드는 F+R 결합 성공 예상, Contig2 예상, "
-                "No contig 예상 순으로 표시합니다. 판정은 현재까지 "
-                "확인된 아홉 AB1 쌍의 실제 결과로 보정했습니다. "
-                "QT16은 New QT 미사용 조건으로, 최소 terminal "
-                "overlap과 gap 포함 Identity를 함께 평가합니다."
+                "지정 범위에서 성공 가능 조건을 찾고, 인접 QT/New "
+                "QT에서도 결과가 유지되는지 평가합니다. 표준 조건은 "
+                "확인된 아홉 AB1 쌍의 실제 결과로 보정했으며, 확장 "
+                "조건은 구조 기반 탐색 후보입니다."
             )
 
             simulation_display_rows = [
@@ -2332,7 +2745,10 @@ if forward_file is not None and reverse_file is not None:
             if best_simulation is not None:
                 recommendation = (
                     f"추천 조건: {best_simulation['조건']} · "
+                    f"{best_simulation['조건 유형']} 조건 · "
                     f"{best_simulation['Contig 예측']} · "
+                    f"안정성 {best_simulation['추천 안정성']} "
+                    f"(인접 성공 {best_simulation['인접 성공']}) · "
                     f"{best_simulation['판정 근거']}"
                 )
 
@@ -2340,7 +2756,20 @@ if forward_file is not None and reverse_file is not None:
                     best_simulation["Contig 예측"]
                     == "F+R 결합 성공 예상"
                 ):
-                    st.success(recommendation)
+                    if best_simulation["조건 유형"] == "확장":
+                        st.info(
+                            recommendation
+                            + " · 확장 조건은 아직 실제 결과 보정이 "
+                            "없으므로 시험 적용 후보입니다."
+                        )
+                    elif best_simulation["추천 안정성"] == "낮음":
+                        st.warning(
+                            recommendation
+                            + " · 단일 조건 성공일 수 있어 실제 적용 전 "
+                            "검토가 필요합니다."
+                        )
+                    else:
+                        st.success(recommendation)
                 elif best_simulation["Contig 예측"] == "Contig2 예상":
                     st.warning(recommendation)
                 else:
@@ -2377,8 +2806,12 @@ if forward_file is not None and reverse_file is not None:
                 f"{no_contig_count}개 조건",
             )
 
-            for batch_start in range(0, len(simulation_rows), 4):
-                card_rows = simulation_rows[
+            st.markdown("#### 추천 후보 상위 조건")
+
+            top_card_rows = simulation_rows[:12]
+
+            for batch_start in range(0, len(top_card_rows), 4):
+                card_rows = top_card_rows[
                     batch_start:batch_start + 4
                 ]
                 card_columns = st.columns(len(card_rows))
@@ -2391,6 +2824,11 @@ if forward_file is not None and reverse_file is not None:
                         with st.container(border=True):
                             st.markdown(
                                 f"### QT {row['조건']}"
+                            )
+                            st.caption(
+                                f"{row['조건 유형']} 조건 · "
+                                f"안정성 {row['추천 안정성']} · "
+                                f"인접 성공 {row['인접 성공']}"
                             )
 
                             if (
