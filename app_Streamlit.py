@@ -766,6 +766,14 @@ CONDITION_THRESHOLDS = {
 MIN_DIRECT_30_20_OVERLAP = 70
 MIN_CONTIG2_OVERLAP = 40
 
+# KCKM1002-4 NS1/NS24처럼 overlap 전체는 길고 junction은 깨끗하지만,
+# overlap 내부에 gap이 분산되어 Q30 연속 match와 conflict 비율이
+# 일반 직접 결합 기준을 통과하지 못하는 실제 30/20 성공 유형입니다.
+# QT16의 보수 기준은 그대로 유지하고 30/20에서만 별도로 평가합니다.
+MIN_LONG_GAPPED_30_20_OVERLAP = 250
+MIN_LONG_GAPPED_30_20_GAP_IDENTITY = 85
+MAX_LONG_GAPPED_30_20_TERMINAL_SLACK = 50
+
 # New QT를 사용하지 않는 QT16 조건은 낮은 품질 말단을 별도로
 # 확장/제외하는 보조 단계가 없습니다. 70 bp 미만의 overlap은 더
 # 엄격한 gap 기준을 만족하는 경우에만 허용하고, 70 bp 이상도 gap
@@ -1100,6 +1108,25 @@ def classify_contig_prediction(
         and low_quality_fraction >= 0.70
     )
 
+    # 긴 overlap 전체가 충분히 유사하고 두 read의 연결부가 깨끗하면,
+    # 내부에 분산된 gap 때문에 Q30 연속 match가 8 bp보다 짧아도
+    # 실제 회사 프로그램의 30/20 결합 가능 패턴으로 인정합니다.
+    # 짧은 overlap의 false positive와 QT16 오판에는 적용하지 않습니다.
+    long_gapped_30_20_success = (
+        overlap_length >= MIN_LONG_GAPPED_30_20_OVERLAP
+        and overlap_result["base_identity"] >= 97
+        and gap_included_identity
+        >= MIN_LONG_GAPPED_30_20_GAP_IDENTITY
+        and weighted_identity >= 92
+        and qt_matches >= 80
+        and qt_longest_match_run >= 6
+        and qt_conflicts <= max(20, int(qt_matches * 0.20))
+        and total_slack
+        <= MAX_LONG_GAPPED_30_20_TERMINAL_SLACK
+        and terminal_high_quality <= 10
+        and low_quality_fraction >= 0.75
+    )
+
     reverse_orientation = overlap_result.get(
         "reverse_orientation",
         "",
@@ -1122,6 +1149,7 @@ def classify_contig_prediction(
         and (
             direct_30_20_success
             or low_quality_terminal_rescue
+            or long_gapped_30_20_success
             or internal_overlap_mode is not None
         )
     ):
@@ -1135,6 +1163,14 @@ def classify_contig_prediction(
             success_basis = (
                 "30/20 저품질 말단 soft-clip 성공 패턴 충족; "
                 f"말단 저품질 비율 {low_quality_fraction * 100:.1f}%"
+            )
+        elif long_gapped_30_20_success:
+            success_basis = (
+                "30/20 장거리 overlap과 깨끗한 junction 성공 패턴 "
+                f"충족; overlap {overlap_length} bp, gap 포함 "
+                f"Identity {gap_included_identity:.2f}%, Q"
+                f"{qt_threshold} 최장 연속 match "
+                f"{qt_longest_match_run} bp"
             )
         else:
             success_basis = (
@@ -2572,6 +2608,9 @@ st.caption(
     "합니다. 20계열의 좋은 junction은 성공을 확정하지 않고 "
     "Contig2를 우선합니다. QT16은 New QT 미사용 조건이므로 "
     "짧은 overlap과 gap이 많은 정렬을 보수적으로 평가합니다. "
+    "30/20은 긴 overlap 전체의 유사도가 높고 junction에 남는 "
+    "고품질 말단이 적으면, 내부에 gap이 분산된 유형도 별도 "
+    "성공 패턴으로 평가합니다. "
     "Primer 파일명은 판정에 사용하지 않고 Reverse 원본과 "
     "reverse-complement를 모두 비교해 정렬 방향을 선택합니다."
 )
