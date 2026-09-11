@@ -741,6 +741,7 @@ COMPANY_CONDITIONS = [
     "20",
     "20/10",
     "20/20",
+    "25/21",
     "30/10",
     "30/20",
     "30/40",
@@ -754,6 +755,7 @@ CONDITION_THRESHOLDS = {
     "20": (20, None),
     "20/10": (20, 10),
     "20/20": (20, 20),
+    "25/21": (25, 21),
     "30/10": (30, 10),
     "30/20": (30, 20),
     "30/40": (30, 40),
@@ -775,11 +777,14 @@ MIN_LONG_GAPPED_30_20_OVERLAP = 250
 MIN_LONG_GAPPED_30_20_GAP_IDENTITY = 85
 MAX_LONG_GAPPED_30_20_TERMINAL_SLACK = 50
 
-# A-B21처럼 긴 내부 overlap 양쪽의 read-through가 대부분 New QT
-# 미만이면 30/20에서 제거 가능한 말단으로 볼 수 있습니다. 반대로
-# TTO_TB2607003처럼 New QT 20 이상 염기가 더 많이 남으면 내부
-# alignment가 매우 좋아도 실제 출력은 Contig2가 될 수 있습니다.
-MIN_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION = 0.78
+# 긴 내부 overlap 양쪽의 read-through가 대부분 New QT 미만이면
+# 제거 가능한 말단으로 볼 수 있습니다. TTO 변형 사례처럼 저품질
+# 비율이 78~80% 경계이면 gap 포함 Identity까지 함께 확인합니다.
+# 이 복합 경계로 TTO 30/20 Contig2와 25/21 성공을 구분하면서,
+# A-B21 30/20 성공 패턴을 유지합니다.
+MIN_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION = 0.80
+MIN_MARGINAL_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION = 0.78
+MIN_MARGINAL_HIGH_QT_INTERNAL_GAP_IDENTITY = 96
 
 # New QT를 사용하지 않는 QT16 조건은 낮은 품질 말단을 별도로
 # 확장/제외하는 보조 단계가 없습니다. 70 bp 미만의 overlap은 더
@@ -872,6 +877,27 @@ def has_strong_deep_internal_structure(overlap_result):
     )
 
 
+def has_clippable_high_qt_internal_terminal(overlap_result):
+    """고QT 내부 overlap의 양쪽 read-through가 제거 가능한지 평가합니다."""
+
+    low_quality_fraction = overlap_result[
+        "terminal_low_quality_fraction"
+    ]
+
+    if (
+        low_quality_fraction
+        >= MIN_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION
+    ):
+        return True
+
+    return (
+        low_quality_fraction
+        >= MIN_MARGINAL_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION
+        and overlap_result["gap_included_identity"]
+        >= MIN_MARGINAL_HIGH_QT_INTERNAL_GAP_IDENTITY
+    )
+
+
 def deep_internal_overlap_mode(
     overlap_result,
     qt_threshold,
@@ -914,8 +940,7 @@ def deep_internal_overlap_mode(
         and 15 <= new_qt_threshold <= 25
         and minimum_anchor_quality >= 30
         and longest_run >= 20
-        and overlap_result["terminal_low_quality_fraction"]
-        >= MIN_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION
+        and has_clippable_high_qt_internal_terminal(overlap_result)
     ):
         return "고QT 장거리 내부 overlap"
 
@@ -957,8 +982,9 @@ def deep_internal_contig2_candidate(
         and 15 <= new_qt_threshold <= 25
         and minimum_anchor_quality >= 30
         and longest_run >= 20
-        and overlap_result["terminal_low_quality_fraction"]
-        < MIN_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION
+        and not has_clippable_high_qt_internal_terminal(
+            overlap_result
+        )
     )
 
     return low_qt_anchor_boundary or high_qt_unclippable_boundary
@@ -1209,6 +1235,24 @@ def classify_contig_prediction(
             "reason": success_basis,
         }
 
+    # TTO M13의 실제 25/21 결합 성공 사례입니다. 긴 내부 overlap과
+    # 제거 가능한 양쪽 read-through가 함께 확인되는 경우에만 표준
+    # 성공 조건으로 인정합니다.
+    if (
+        condition_label == "25/21"
+        and reverse_orientation == "Reverse-complement 적용"
+        and internal_overlap_mode is not None
+    ):
+        return {
+            "status": "F+R 결합 성공 예상",
+            "rank": 2,
+            "reason": (
+                f"25/21 {internal_overlap_mode} 실제 성공 패턴 충족; "
+                f"Q{qt_threshold} 최장 연속 match "
+                f"{qt_longest_match_run} bp"
+            ),
+        }
+
     # WT-260831-28 및 KNIBR033의 실제 30/20 Contig2 패턴입니다.
     # Quality와 junction은 양호하지만 overlap 자체가 70 bp보다
     # 짧아 하나의 안정적인 consensus로 승격되기에는 근거가
@@ -1242,11 +1286,23 @@ def classify_contig_prediction(
             "status": "Contig2 예상",
             "rank": 1,
             "reason": (
-                "장거리 내부 overlap은 강하지만 30/20에서 제거 가능한 "
-                "말단 저품질 비율이 "
-                f"{low_quality_fraction * 100:.1f}%로 "
-                f"{MIN_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION * 100:.0f}% "
-                "미만; F/R 개별 출력 보정 패턴"
+                "장거리 내부 overlap은 강하지만 30/20 말단 제거 "
+                "안정성 기준 미충족(저품질 말단 "
+                f"{low_quality_fraction * 100:.1f}%, gap 포함 Identity "
+                f"{gap_included_identity:.2f}%); F/R 개별 출력 보정 패턴"
+            ),
+        }
+
+    if (
+        condition_label == "25/21"
+        and internal_contig2_candidate
+    ):
+        return {
+            "status": "Contig2 예상",
+            "rank": 1,
+            "reason": (
+                "25/21 장거리 내부 overlap은 있으나 말단 제거 또는 "
+                "연속 anchor 안정성 기준 미충족; F/R 개별 출력 예상"
             ),
         }
 
@@ -1656,9 +1712,8 @@ def classify_exploratory_prediction(
             "status": "Contig2 예상",
             "rank": 1,
             "reason": (
-                "장거리 내부 overlap은 강하지만 Q"
-                f"{qt_threshold} 최장 연속 match {longest_run} bp로 "
-                "성공 anchor 기준 미충족"
+                "장거리 내부 overlap은 강하지만 말단 제거 또는 Q"
+                f"{qt_threshold} 연속 anchor 안정성 기준 미충족"
             ),
         }
 
@@ -2643,6 +2698,7 @@ st.subheader("조건 설정")
 st.caption(
     "실제 분석에 사용하는 조건을 개별 프리셋으로 평가합니다. "
     "16과 20은 New QT를 사용하지 않는 단독 QT 조건이며, "
+    "25/21은 실제 M13 결합 성공 사례가 확인된 조건입니다. "
     "30/40과 단독 10도 유효한 독립 조건입니다. 현재 조건별 "
     "출력 유형은 현재까지 확인된 AB1 쌍의 실제 결과를 기준으로 "
     "보수적으로 보정되어 있으며, 추가 사례에 따라 갱신해야 "
