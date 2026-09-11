@@ -781,24 +781,28 @@ MAX_LONG_GAPPED_30_20_TERMINAL_SLACK = 50
 # 제거 가능한 말단으로 볼 수 있습니다. TTO 변형 사례처럼 저품질
 # 비율이 78~80% 경계이면 gap 포함 Identity까지 함께 확인합니다.
 # 이 복합 경계로 TTO 30/20 Contig2와 25/21 성공을 구분하면서,
-# A-B21 30/20 성공 패턴을 유지합니다.
+# A-B21 30/20 성공 패턴을 유지합니다. 고QT 내부 overlap 성공은
+# 실제 성공군과 신규 Contig2군을 구분하기 위해 300 bp 이상을
+# 추가로 요구합니다.
 MIN_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION = 0.80
 MIN_MARGINAL_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION = 0.78
 MIN_MARGINAL_HIGH_QT_INTERNAL_GAP_IDENTITY = 96
+MIN_HIGH_QT_INTERNAL_SUCCESS_OVERLAP = 300
 
 # WT-M13 20/10 실제 결과를 구분하는 장거리 내부 overlap 경계입니다.
 # 성공 사례는 overlap 295 bp / read-through 797 bp / Q20 연속 43 bp,
-# Contig2 사례는 각각 270 bp / 855 bp / 74 bp 및
-# 294 bp / 805 bp / 36 bp였습니다. 따라서 연속 match 하나가 아닌
-# overlap 길이와 양쪽 read-through 부담까지 함께 평가합니다.
+# Contig2 사례는 각각 270 bp / 855 bp / 74 bp,
+# 294 bp / 805 bp / 36 bp, 317 bp / 760 bp / 40 bp였습니다.
+# 따라서 연속 match 하나가 아닌 overlap 길이와 양쪽 read-through
+# 부담까지 함께 평가하며, Q20 연속 성공 경계는 43 bp입니다.
 MIN_LOW_QT_INTERNAL_SUCCESS_OVERLAP = 280
 MAX_LOW_QT_INTERNAL_SUCCESS_TERMINAL_SLACK = 800
-MIN_LOW_QT_INTERNAL_SUCCESS_LONGEST_RUN = 40
+MIN_LOW_QT_INTERNAL_SUCCESS_LONGEST_RUN = 43
 MIN_LOW_QT_INTERNAL_CONTIG2_LONGEST_RUN = 30
 
 # New QT를 사용하지 않는 QT16 조건은 낮은 품질 말단을 별도로
-# 확장/제외하는 보조 단계가 없습니다. 70 bp 미만의 overlap은 더
-# 엄격한 gap 기준을 만족하는 경우에만 허용하고, 70 bp 이상도 gap
+# 확장/제외하는 보조 단계가 없습니다. 75 bp 미만의 overlap은 더
+# 엄격한 gap 기준을 만족하는 경우에만 허용하고, 75 bp 이상도 gap
 # 포함 Identity 하한을 적용합니다. MMC(68 bp/gap 4, 실제 미결합)와
 # KCKM1002-4(gap 포함 Identity 87.39%, 실제 미결합) 사례로
 # 보정했습니다.
@@ -955,6 +959,8 @@ def deep_internal_overlap_mode(
         and 15 <= new_qt_threshold <= 25
         and minimum_anchor_quality >= 30
         and longest_run >= 20
+        and overlap_result["paired_bases"]
+        >= MIN_HIGH_QT_INTERNAL_SUCCESS_OVERLAP
         and has_clippable_high_qt_internal_terminal(overlap_result)
     ):
         return "고QT 장거리 내부 overlap"
@@ -1000,18 +1006,22 @@ def deep_internal_contig2_candidate(
     # 내부 overlap 자체는 강하지만 양쪽 read-through에 New QT 이상
     # 염기가 충분히 남는 경우입니다. 실제 TTO M13 30/20 결과처럼
     # 하나의 consensus로 승격되지 않고 두 contig로 유지될 수 있습니다.
-    high_qt_unclippable_boundary = (
+    high_qt_internal_boundary = (
         has_strong_deep_internal_structure(overlap_result)
         and 25 <= qt_threshold <= 30
         and 15 <= new_qt_threshold <= 25
         and minimum_anchor_quality >= 30
         and longest_run >= 20
-        and not has_clippable_high_qt_internal_terminal(
-            overlap_result
+        and (
+            overlap_result["paired_bases"]
+            < MIN_HIGH_QT_INTERNAL_SUCCESS_OVERLAP
+            or not has_clippable_high_qt_internal_terminal(
+                overlap_result
+            )
         )
     )
 
-    return low_qt_anchor_boundary or high_qt_unclippable_boundary
+    return low_qt_anchor_boundary or high_qt_internal_boundary
 
 
 # --------------------------------------------------
@@ -1278,7 +1288,7 @@ def classify_contig_prediction(
         }
 
     # WT-260831-28 및 KNIBR033의 실제 30/20 Contig2 패턴입니다.
-    # Quality와 junction은 양호하지만 overlap 자체가 70 bp보다
+    # Quality와 junction은 양호하지만 overlap 자체가 75 bp보다
     # 짧아 하나의 안정적인 consensus로 승격되기에는 근거가
     # 부족한 경우 F/R 개별 출력으로 분류합니다.
     short_overlap_contig2 = (
@@ -1660,7 +1670,7 @@ def classify_exploratory_prediction(
     )
 
     direct_success = (
-        overlap_length >= 70
+        overlap_length >= MIN_DIRECT_30_20_OVERLAP
         and base_identity >= 97
         and gap_identity >= 90
         and weighted_identity >= 92
@@ -1668,18 +1678,6 @@ def classify_exploratory_prediction(
         and longest_run >= 8
         and conflicts <= max(8, int(qt_matches * 0.15))
         and terminal_pass
-    )
-
-    clean_short_success = (
-        40 <= overlap_length < 70
-        and base_identity >= 98
-        and gap_identity >= 94
-        and weighted_identity >= 95
-        and gaps <= 3
-        and qt_matches >= 25
-        and longest_run >= 10
-        and terminal_high_quality <= 10
-        and terminal_slack <= 30
     )
 
     low_quality_terminal_rescue = (
@@ -1698,7 +1696,6 @@ def classify_exploratory_prediction(
 
     if (
         direct_success
-        or clean_short_success
         or low_quality_terminal_rescue
         or internal_overlap_mode is not None
     ):
@@ -1713,11 +1710,6 @@ def classify_exploratory_prediction(
                 "확장 조건의 저품질 말단 제외 패턴 충족; "
                 f"soft-clip 저품질 비율 "
                 f"{low_quality_fraction * 100:.1f}%"
-            )
-        elif clean_short_success:
-            success_reason = (
-                "짧지만 gap이 적은 terminal overlap 충족; "
-                f"gap 포함 Identity {gap_identity:.2f}%"
             )
         else:
             success_reason = (
@@ -2004,7 +1996,7 @@ def evaluate_structural_support(overlap_result, qt_threshold):
 
     support_score = 0
 
-    if overlap_length >= 70:
+    if overlap_length >= MIN_DIRECT_30_20_OVERLAP:
         support_score += 2
     elif overlap_length >= 35:
         support_score += 1
@@ -2778,7 +2770,10 @@ with st.expander("조건 시뮬레이터 설정", expanded=False):
         "지정 범위를 먼저 QT 2/New QT 5 단위로 탐색한 뒤 상위 "
         "후보 주변을 1단위로 정밀 분석합니다. 표준 조건은 실제 "
         "사례 보정값을 유지하고, 그 외 값은 확장 조건으로 "
-        "표시합니다. 선택한 현재 조건은 범위 밖이어도 비교를 위해 "
+        "표시합니다. 확장 조건도 75 bp 미만의 짧은 overlap은 "
+        "성공으로 승격하지 않으며, 장거리 내부 overlap은 확인된 "
+        "구조 경계를 모두 통과해야 합니다. 선택한 현재 조건은 "
+        "범위 밖이어도 비교를 위해 "
         "자동 포함합니다."
     )
 
