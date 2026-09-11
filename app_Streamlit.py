@@ -231,6 +231,8 @@ def build_terminal_candidate(
     qt_supported_ambiguous = 0
     qt_supported_longest_match_run = 0
     qt_supported_current_match_run = 0
+    longest_gap_run = 0
+    current_gap_run = 0
 
     for left_index, right_index in zip(
         indices[0],
@@ -238,6 +240,11 @@ def build_terminal_candidate(
     ):
         if left_index < 0 or right_index < 0:
             gaps += 1
+            current_gap_run += 1
+            longest_gap_run = max(
+                longest_gap_run,
+                current_gap_run,
+            )
             markers.append(" ")
             qt_supported_current_match_run = 0
 
@@ -258,6 +265,8 @@ def build_terminal_candidate(
                 qt_supported_gaps += 1
 
             continue
+
+        current_gap_run = 0
 
         full_left_index = (
             left_window_start + int(left_index)
@@ -483,6 +492,7 @@ def build_terminal_candidate(
         "matches": matches,
         "mismatches": mismatches,
         "gaps": gaps,
+        "longest_gap_run": longest_gap_run,
         "ambiguous": ambiguous,
         "identity": round(base_identity, 2),
         "base_identity": round(base_identity, 2),
@@ -776,6 +786,7 @@ MIN_CONTIG2_OVERLAP = 40
 MIN_LONG_GAPPED_30_20_OVERLAP = 250
 MIN_LONG_GAPPED_30_20_GAP_IDENTITY = 85
 MAX_LONG_GAPPED_30_20_TERMINAL_SLACK = 50
+MAX_LONG_GAPPED_30_20_GAP_RUN = 2
 
 # 긴 내부 overlap 양쪽의 read-through가 대부분 New QT 미만이면
 # 제거 가능한 말단으로 볼 수 있습니다. TTO 변형 사례처럼 저품질
@@ -1057,6 +1068,10 @@ def classify_contig_prediction(
         "qt_supported_longest_match_run"
     ]
     qt_conflicts = overlap_result["qt_supported_conflicts"]
+    longest_gap_run = overlap_result.get(
+        "longest_gap_run",
+        overlap_result["gaps"],
+    )
     total_slack = overlap_result["terminal_slack_total"]
     terminal_high_quality = overlap_result[
         "terminal_high_quality_bases"
@@ -1196,7 +1211,7 @@ def classify_contig_prediction(
     # 내부에 분산된 gap 때문에 Q30 연속 match가 8 bp보다 짧아도
     # 실제 회사 프로그램의 30/20 결합 가능 패턴으로 인정합니다.
     # 짧은 overlap의 false positive와 QT16 오판에는 적용하지 않습니다.
-    long_gapped_30_20_success = (
+    long_gapped_30_20_evidence = (
         overlap_length >= MIN_LONG_GAPPED_30_20_OVERLAP
         and overlap_result["base_identity"] >= 97
         and gap_included_identity
@@ -1209,6 +1224,23 @@ def classify_contig_prediction(
         <= MAX_LONG_GAPPED_30_20_TERMINAL_SLACK
         and terminal_high_quality <= 10
         and low_quality_fraction >= 0.75
+    )
+
+    # 긴 overlap에서 gap 총량만 보면 서로 다른 구조가 같은 점수를
+    # 받을 수 있습니다. KCKM 성공 사례는 gap이 최대 2 bp씩
+    # 분산됐지만 C_NS1/NS24 Contig2 사례는 4 bp 연속 gap이 있어
+    # consensus 연결부가 한 번에 크게 끊겼습니다. 따라서 장거리
+    # gap 보정형 성공은 연속 gap 2 bp 이하일 때만 허용합니다.
+    long_gapped_30_20_success = (
+        long_gapped_30_20_evidence
+        and longest_gap_run
+        <= MAX_LONG_GAPPED_30_20_GAP_RUN
+    )
+
+    fragmented_long_gapped_30_20_contig2 = (
+        long_gapped_30_20_evidence
+        and longest_gap_run
+        > MAX_LONG_GAPPED_30_20_GAP_RUN
     )
 
     reverse_orientation = overlap_result.get(
@@ -1309,6 +1341,22 @@ def classify_contig_prediction(
                 "30/20 정렬 근거는 있으나 terminal overlap "
                 f"{overlap_length} bp로 {MIN_DIRECT_30_20_OVERLAP} "
                 "bp 미만; F/R 개별 출력 보정 패턴"
+            ),
+        }
+
+    if (
+        condition_label == "30/20"
+        and reverse_orientation == "Reverse-complement 적용"
+        and fragmented_long_gapped_30_20_contig2
+    ):
+        return {
+            "status": "Contig2 예상",
+            "rank": 1,
+            "reason": (
+                "30/20 장거리 overlap은 확인되지만 최장 연속 gap "
+                f"{longest_gap_run} bp로 허용 경계 "
+                f"{MAX_LONG_GAPPED_30_20_GAP_RUN} bp 초과; "
+                "연결부 단절 위험으로 F/R 개별 출력 보정 패턴"
             ),
         }
 
@@ -2306,6 +2354,7 @@ def empty_overlap_result():
         "gap_included_identity": 0,
         "quality_weighted_identity": 0,
         "gaps": 0,
+        "longest_gap_run": 0,
         "qt_supported_matches": 0,
         "qt_supported_longest_match_run": 0,
         "qt_supported_conflicts": 0,
@@ -2398,6 +2447,7 @@ def evaluate_condition_values(
             "qt_supported_conflicts"
         ],
         "Gap": safe_overlap["gaps"],
+        "최장 연속 Gap": safe_overlap["longest_gap_run"],
         "연결 방향": safe_overlap["connection_direction"],
         "Reverse 처리": safe_overlap["reverse_orientation"],
         "왼쪽 junction soft-clip": safe_overlap[
@@ -2723,8 +2773,9 @@ st.caption(
     "Contig2를 우선합니다. QT16은 New QT 미사용 조건이므로 "
     "75 bp 미만 overlap과 gap이 많은 정렬을 보수적으로 평가합니다. "
     "30/20은 긴 overlap 전체의 유사도가 높고 junction에 남는 "
-    "고품질 말단이 적으면, 내부에 gap이 분산된 유형도 별도 "
-    "성공 패턴으로 평가합니다. 직접 결합형은 최소 75 bp의 "
+    "고품질 말단이 적으면, 내부 gap이 2 bp 이하로 짧게 분산된 "
+    "유형도 별도 성공 패턴으로 평가합니다. 3 bp 이상 연속 gap은 "
+    "Contig2 위험으로 구분합니다. 직접 결합형은 최소 75 bp의 "
     "overlap을 요구합니다. "
     "Primer 파일명은 판정에 사용하지 않고 Reverse 원본과 "
     "reverse-complement를 모두 비교해 정렬 방향을 선택합니다."
@@ -2939,6 +2990,9 @@ if forward_file is not None and reverse_file is not None:
                                 "Match": overlap_result["matches"],
                                 "Mismatch": overlap_result["mismatches"],
                                 "Gap": overlap_result["gaps"],
+                                "최장 연속 Gap": overlap_result[
+                                    "longest_gap_run"
+                                ],
                             }
                         ]
                     )
@@ -3020,6 +3074,7 @@ if forward_file is not None and reverse_file is not None:
 - **경계 기준 이상 soft-clip 염기**는 제외 후보 중 현재 품질 경계 이상인 염기 수입니다. New QT 사용 조건에서는 New QT, 미사용 조건에서는 QT가 경계가 됩니다. 값이 크면 신뢰도 높은 서열을 많이 버려야 하므로 불리합니다.
 - **Soft-clip 저품질 비율**은 제외 후보 중 현재 품질 경계 미만 염기의 비율입니다. 높을수록 말단 제외가 합리적이라는 보조 근거입니다.
 - **QT 최장 연속 Match**는 양쪽 염기가 모두 현재 QT 이상이면서 정확히 일치하는 구간 중 가장 긴 연속 길이입니다. QT 지지 Match 총량이 많아도 이 값이 짧으면 고품질 anchor가 여러 조각으로 끊긴 상태입니다.
+- **최장 연속 Gap**은 정렬 중 한 번에 연속해서 끊긴 길이입니다. Gap 총량이 비슷해도 이 값이 3 bp 이상이면 한 contig로 합칠 때 연결부 단절 위험을 더 크게 봅니다.
 - **장거리 내부 overlap**은 양쪽 read 끝에 긴 read-through가 남아도 내부에서 250 bp 이상의 강하고 연속적인 overlap이 확인되는 유형입니다. Primer명과 무관하게 평가하며, 일반 terminal overlap보다 엄격한 Identity·gap·anchor 기준을 적용합니다.
                         """
                     )
