@@ -774,19 +774,25 @@ MIN_LONG_GAPPED_30_20_OVERLAP = 250
 MIN_LONG_GAPPED_30_20_GAP_IDENTITY = 85
 MAX_LONG_GAPPED_30_20_TERMINAL_SLACK = 50
 
+# A-B21처럼 긴 내부 overlap 양쪽의 read-through가 대부분 New QT
+# 미만이면 30/20에서 제거 가능한 말단으로 볼 수 있습니다. 반대로
+# TTO_TB2607003처럼 New QT 20 이상 염기가 더 많이 남으면 내부
+# alignment가 매우 좋아도 실제 출력은 Contig2가 될 수 있습니다.
+MIN_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION = 0.78
+
 # New QT를 사용하지 않는 QT16 조건은 낮은 품질 말단을 별도로
 # 확장/제외하는 보조 단계가 없습니다. 70 bp 미만의 overlap은 더
 # 엄격한 gap 기준을 만족하는 경우에만 허용하고, 70 bp 이상도 gap
 # 포함 Identity 하한을 적용합니다. MMC(68 bp/gap 4, 실제 미결합)와
 # KCKM1002-4(gap 포함 Identity 87.39%, 실제 미결합) 사례로
 # 보정했습니다.
-MIN_DIRECT_QT16_OVERLAP = 70
+MIN_DIRECT_QT16_OVERLAP = 75
 MIN_QT16_GAP_INCLUDED_IDENTITY = 90
 MIN_SHORT_QT16_OVERLAP = 40
 MIN_SHORT_QT16_GAP_INCLUDED_IDENTITY = 94
 MAX_SHORT_QT16_GAPS = 3
 
-# 현재까지 확인된 열두 AB1 쌍의 실제 결과로 보정한 조건별
+# 현재까지 확인된 AB1 쌍의 실제 결과로 보정한 조건별
 # 출력 유형입니다.
 # 20계열은 terminal overlap이 좋아 보여도 성공으로 자동 승격하지
 # 않고 F/R 개별 출력(Contig2)을 우선합니다.
@@ -907,6 +913,8 @@ def deep_internal_overlap_mode(
         and 15 <= new_qt_threshold <= 25
         and minimum_anchor_quality >= 30
         and longest_run >= 20
+        and overlap_result["terminal_low_quality_fraction"]
+        >= MIN_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION
     ):
         return "고QT 장거리 내부 overlap"
 
@@ -931,13 +939,28 @@ def deep_internal_contig2_candidate(
         overlap_result["reverse_junction_anchor_mean_quality"],
     )
 
-    return (
+    low_qt_anchor_boundary = (
         has_strong_deep_internal_structure(overlap_result)
         and 20 <= qt_threshold < 25
         and 10 <= new_qt_threshold <= 12
         and minimum_anchor_quality >= 38
         and 30 <= longest_run < 40
     )
+
+    # 내부 overlap 자체는 강하지만 양쪽 read-through에 New QT 이상
+    # 염기가 충분히 남는 경우입니다. 실제 TTO M13 30/20 결과처럼
+    # 하나의 consensus로 승격되지 않고 두 contig로 유지될 수 있습니다.
+    high_qt_unclippable_boundary = (
+        has_strong_deep_internal_structure(overlap_result)
+        and 25 <= qt_threshold <= 30
+        and 15 <= new_qt_threshold <= 25
+        and minimum_anchor_quality >= 30
+        and longest_run >= 20
+        and overlap_result["terminal_low_quality_fraction"]
+        < MIN_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION
+    )
+
+    return low_qt_anchor_boundary or high_qt_unclippable_boundary
 
 
 # --------------------------------------------------
@@ -1210,6 +1233,22 @@ def classify_contig_prediction(
             ),
         }
 
+    if (
+        condition_label == "30/20"
+        and internal_contig2_candidate
+    ):
+        return {
+            "status": "Contig2 예상",
+            "rank": 1,
+            "reason": (
+                "장거리 내부 overlap은 강하지만 30/20에서 제거 가능한 "
+                "말단 저품질 비율이 "
+                f"{low_quality_fraction * 100:.1f}%로 "
+                f"{MIN_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION * 100:.0f}% "
+                "미만; F/R 개별 출력 보정 패턴"
+            ),
+        }
+
     # 긴 read-through가 양쪽에 남은 read 쌍에서 내부 overlap이
     # 매우 강하고 junction anchor가 깨끗한 경우입니다. WT-M13의
     # 실제 20/10 성공 사례로 보정했지만 primer명은 사용하지 않아
@@ -1244,7 +1283,7 @@ def classify_contig_prediction(
 
     # 16S 기본값인 QT16 단독 조건입니다. New QT를 사용하지 않고
     # QT16을 말단 품질 경계로 삼아 구조적 overlap을 평가합니다.
-    # New QT의 말단 보정이 없으므로 70 bp 이상의 직접 overlap과
+    # New QT의 말단 보정이 없으므로 75 bp 이상의 직접 overlap과
     # gap 포함 Identity 90% 이상을 함께 요구합니다. 다만 기존에
     # 일치했던 짧고 깨끗한 overlap 사례는 gap 포함 Identity 94%
     # 이상, gap 3개 이하일 때만 별도로 허용합니다.
@@ -1358,7 +1397,8 @@ def classify_contig_prediction(
 
             if short_failures:
                 qt16_reasons.append(
-                    "70 bp 미만 overlap의 엄격 기준 미충족("
+                    f"{MIN_DIRECT_QT16_OVERLAP} bp 미만 overlap의 "
+                    "엄격 기준 미충족("
                     + ", ".join(short_failures)
                     + ")"
                 )
@@ -2603,11 +2643,11 @@ st.caption(
     "실제 분석에 사용하는 조건을 개별 프리셋으로 평가합니다. "
     "16과 20은 New QT를 사용하지 않는 단독 QT 조건이며, "
     "30/40과 단독 10도 유효한 독립 조건입니다. 현재 조건별 "
-    "출력 유형은 현재 확인된 열두 AB1 쌍의 실제 결과를 기준으로 "
+    "출력 유형은 현재까지 확인된 AB1 쌍의 실제 결과를 기준으로 "
     "보수적으로 보정되어 있으며, 추가 사례에 따라 갱신해야 "
     "합니다. 20계열의 좋은 junction은 성공을 확정하지 않고 "
     "Contig2를 우선합니다. QT16은 New QT 미사용 조건이므로 "
-    "짧은 overlap과 gap이 많은 정렬을 보수적으로 평가합니다. "
+    "75 bp 미만 overlap과 gap이 많은 정렬을 보수적으로 평가합니다. "
     "30/20은 긴 overlap 전체의 유사도가 높고 junction에 남는 "
     "고품질 말단이 적으면, 내부에 gap이 분산된 유형도 별도 "
     "성공 패턴으로 평가합니다. "
@@ -2961,7 +3001,7 @@ if forward_file is not None and reverse_file is not None:
             st.caption(
                 "지정 범위에서 성공 가능 조건을 찾고, 인접 QT/New "
                 "QT에서도 결과가 유지되는지 평가합니다. 표준 조건은 "
-                "확인된 열두 AB1 쌍의 실제 결과로 보정했으며, 확장 "
+                "확인된 AB1 쌍의 실제 결과로 보정했으며, 확장 "
                 "조건은 구조 기반 탐색 후보입니다."
             )
 
