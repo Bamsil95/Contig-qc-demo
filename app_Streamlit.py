@@ -762,8 +762,9 @@ CONDITION_THRESHOLDS = {
 # 30/20에서 저품질 말단이 제거 가능하더라도, 짧은 overlap만으로
 # F/R 결합 성공을 과대 판정하지 않도록 하는 경험적 하한입니다.
 # 현재 성공 사례(KHS2: 75 bp)와 Contig2 사례
-# (WT: 60 bp, KNIBR033: 69 bp)를 기준으로 보정했습니다.
-MIN_DIRECT_30_20_OVERLAP = 70
+# (WT: 60 bp, KNIBR033: 69 bp, B-OT-119: 74 bp)를 기준으로
+# 보정했습니다. 따라서 30/20 직접 결합은 75 bp부터 인정합니다.
+MIN_DIRECT_30_20_OVERLAP = 75
 MIN_CONTIG2_OVERLAP = 40
 
 # KCKM1002-4 NS1/NS24처럼 overlap 전체는 길고 junction은 깨끗하지만,
@@ -1157,7 +1158,7 @@ def classify_contig_prediction(
 
     # 현재 확인된 NS1/NS24 및 785F/907R 성공 패턴입니다.
     # 짧은 overlap은 말단 품질이 좋아도 회사 프로그램에서
-    # Contig2로 남을 수 있으므로, 직접 결합형에는 최소 70 bp의
+    # Contig2로 남을 수 있으므로, 직접 결합형에는 최소 75 bp의
     # overlap을 요구합니다. 긴 저품질 말단 rescue 유형은 별도로
     # 평가합니다.
     direct_30_20_success = (
@@ -2650,7 +2651,8 @@ st.caption(
     "75 bp 미만 overlap과 gap이 많은 정렬을 보수적으로 평가합니다. "
     "30/20은 긴 overlap 전체의 유사도가 높고 junction에 남는 "
     "고품질 말단이 적으면, 내부에 gap이 분산된 유형도 별도 "
-    "성공 패턴으로 평가합니다. "
+    "성공 패턴으로 평가합니다. 직접 결합형은 최소 75 bp의 "
+    "overlap을 요구합니다. "
     "Primer 파일명은 판정에 사용하지 않고 Reverse 원본과 "
     "reverse-complement를 모두 비교해 정렬 방향을 선택합니다."
 )
