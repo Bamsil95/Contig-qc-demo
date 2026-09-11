@@ -786,6 +786,16 @@ MIN_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION = 0.80
 MIN_MARGINAL_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION = 0.78
 MIN_MARGINAL_HIGH_QT_INTERNAL_GAP_IDENTITY = 96
 
+# WT-M13 20/10 실제 결과를 구분하는 장거리 내부 overlap 경계입니다.
+# 성공 사례는 overlap 295 bp / read-through 797 bp / Q20 연속 43 bp,
+# Contig2 사례는 각각 270 bp / 855 bp / 74 bp 및
+# 294 bp / 805 bp / 36 bp였습니다. 따라서 연속 match 하나가 아닌
+# overlap 길이와 양쪽 read-through 부담까지 함께 평가합니다.
+MIN_LOW_QT_INTERNAL_SUCCESS_OVERLAP = 280
+MAX_LOW_QT_INTERNAL_SUCCESS_TERMINAL_SLACK = 800
+MIN_LOW_QT_INTERNAL_SUCCESS_LONGEST_RUN = 40
+MIN_LOW_QT_INTERNAL_CONTIG2_LONGEST_RUN = 30
+
 # New QT를 사용하지 않는 QT16 조건은 낮은 품질 말단을 별도로
 # 확장/제외하는 보조 단계가 없습니다. 70 bp 미만의 overlap은 더
 # 엄격한 gap 기준을 만족하는 경우에만 허용하고, 70 bp 이상도 gap
@@ -929,7 +939,12 @@ def deep_internal_overlap_mode(
         20 <= qt_threshold < 25
         and 10 <= new_qt_threshold <= 12
         and minimum_anchor_quality >= 38
-        and longest_run >= 40
+        and overlap_result["paired_bases"]
+        >= MIN_LOW_QT_INTERNAL_SUCCESS_OVERLAP
+        and overlap_result["terminal_slack_total"]
+        <= MAX_LOW_QT_INTERNAL_SUCCESS_TERMINAL_SLACK
+        and longest_run
+        >= MIN_LOW_QT_INTERNAL_SUCCESS_LONGEST_RUN
     ):
         return "고품질 장거리 내부 overlap"
 
@@ -970,7 +985,16 @@ def deep_internal_contig2_candidate(
         and 20 <= qt_threshold < 25
         and 10 <= new_qt_threshold <= 12
         and minimum_anchor_quality >= 38
-        and 30 <= longest_run < 40
+        and longest_run
+        >= MIN_LOW_QT_INTERNAL_CONTIG2_LONGEST_RUN
+        and (
+            longest_run
+            < MIN_LOW_QT_INTERNAL_SUCCESS_LONGEST_RUN
+            or overlap_result["paired_bases"]
+            < MIN_LOW_QT_INTERNAL_SUCCESS_OVERLAP
+            or overlap_result["terminal_slack_total"]
+            > MAX_LOW_QT_INTERNAL_SUCCESS_TERMINAL_SLACK
+        )
     )
 
     # 내부 overlap 자체는 강하지만 양쪽 read-through에 New QT 이상
@@ -1332,9 +1356,10 @@ def classify_contig_prediction(
             "status": "Contig2 예상",
             "rank": 1,
             "reason": (
-                "장거리 내부 overlap은 강하지만 Q20 최장 연속 "
-                f"match {qt_longest_match_run} bp로 성공 기준 "
-                "40 bp 미만; F/R 개별 출력 예상"
+                "장거리 내부 overlap은 강하지만 20/10 성공 안정성 "
+                f"기준 미충족(overlap {overlap_length} bp, junction "
+                f"read-through {total_slack} bp, Q20 최장 연속 match "
+                f"{qt_longest_match_run} bp); F/R 개별 출력 예상"
             ),
         }
 
