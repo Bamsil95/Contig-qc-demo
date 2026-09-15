@@ -134,6 +134,7 @@ def normalize_alignment_sequence(sequence):
 TERMINAL_SEARCH_BASES = 700
 GAP_QUALITY_WEIGHT = 0.5
 JUNCTION_ANCHOR_BASES = 60
+JUNCTION_SOFTCLIP_ADJACENT_BASES = 60
 
 
 def quality_weight(quality):
@@ -353,6 +354,17 @@ def build_terminal_candidate(
     )
     terminal_slack_total = len(terminal_qualities)
 
+    # 전체 soft-clip의 평균만 보면, 실제 overlap 경계 바로 옆에
+    # 고품질 염기가 몰려 있는 구조를 놓칠 수 있습니다. 왼쪽
+    # read는 tail의 시작, 오른쪽 read는 head의 끝이 junction에
+    # 인접하므로 각각 최대 60 bp를 따로 보존합니다.
+    left_softclip_adjacent_qualities = left_tail_qualities[
+        :JUNCTION_SOFTCLIP_ADJACENT_BASES
+    ]
+    right_softclip_adjacent_qualities = right_head_qualities[
+        -JUNCTION_SOFTCLIP_ADJACENT_BASES:
+    ]
+
     # 정렬 경계 안쪽의 품질을 read별로 따로 평가합니다. 이 값은
     # contig 성공 여부가 아니라 어느 방향의 재반응이 더 유리한지
     # 판단하는 보조 근거로 사용합니다.
@@ -425,6 +437,13 @@ def build_terminal_candidate(
             "softclip": len(left_tail_qualities),
             "high_quality_softclip": left_terminal_high_quality,
             "low_quality_softclip": left_terminal_low_quality,
+            "softclip_adjacent_mean_quality": mean_quality(
+                left_softclip_adjacent_qualities
+            ),
+            "softclip_adjacent_boundary_fraction": threshold_fraction(
+                left_softclip_adjacent_qualities,
+                terminal_quality_threshold,
+            ),
             "anchor_mean_quality": mean_quality(left_anchor_qualities),
             "anchor_qt_fraction": threshold_fraction(
                 left_anchor_qualities,
@@ -435,6 +454,13 @@ def build_terminal_candidate(
             "softclip": len(right_head_qualities),
             "high_quality_softclip": right_terminal_high_quality,
             "low_quality_softclip": right_terminal_low_quality,
+            "softclip_adjacent_mean_quality": mean_quality(
+                right_softclip_adjacent_qualities
+            ),
+            "softclip_adjacent_boundary_fraction": threshold_fraction(
+                right_softclip_adjacent_qualities,
+                terminal_quality_threshold,
+            ),
             "anchor_mean_quality": mean_quality(right_anchor_qualities),
             "anchor_qt_fraction": threshold_fraction(
                 right_anchor_qualities,
@@ -567,6 +593,34 @@ def build_terminal_candidate(
         ),
         "reverse_junction_low_quality_softclip": (
             reverse_junction.get("low_quality_softclip", 0)
+        ),
+        "forward_junction_softclip_adjacent_mean_quality": round(
+            forward_junction.get(
+                "softclip_adjacent_mean_quality",
+                0.0,
+            ),
+            2,
+        ),
+        "reverse_junction_softclip_adjacent_mean_quality": round(
+            reverse_junction.get(
+                "softclip_adjacent_mean_quality",
+                0.0,
+            ),
+            2,
+        ),
+        "forward_junction_softclip_adjacent_boundary_fraction": round(
+            forward_junction.get(
+                "softclip_adjacent_boundary_fraction",
+                0.0,
+            ),
+            4,
+        ),
+        "reverse_junction_softclip_adjacent_boundary_fraction": round(
+            reverse_junction.get(
+                "softclip_adjacent_boundary_fraction",
+                0.0,
+            ),
+            4,
         ),
         "forward_junction_anchor_mean_quality": round(
             forward_junction.get("anchor_mean_quality", 0.0),
@@ -799,6 +853,7 @@ MIN_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION = 0.80
 MIN_MARGINAL_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION = 0.78
 MIN_MARGINAL_HIGH_QT_INTERNAL_GAP_IDENTITY = 96
 MIN_HIGH_QT_INTERNAL_SUCCESS_OVERLAP = 300
+MAX_HIGH_QT_INTERNAL_ADJACENT_SOFTCLIP_MEAN = 24
 
 # WT-M13 20/10 실제 결과를 구분하는 장거리 내부 overlap 경계입니다.
 # 성공 사례는 overlap 295 bp / read-through 797 bp / Q20 연속 43 bp,
@@ -908,6 +963,27 @@ def has_clippable_high_qt_internal_terminal(overlap_result):
     low_quality_fraction = overlap_result[
         "terminal_low_quality_fraction"
     ]
+    maximum_adjacent_softclip_mean = max(
+        overlap_result.get(
+            "forward_junction_softclip_adjacent_mean_quality",
+            0.0,
+        ),
+        overlap_result.get(
+            "reverse_junction_softclip_adjacent_mean_quality",
+            0.0,
+        ),
+    )
+
+    # MLT 26/24 Contig2 사례는 전체 soft-clip의 86.7%가 Q24
+    # 미만이었지만, overlap 직후 Forward 60 bp 평균이 Q26.83으로
+    # 높았습니다. A-B21/TTO 성공 사례(Q22.92/Q22.55 이하)와 달리
+    # 경계 바로 옆의 신뢰 염기를 잘라야 하므로 제거 가능 말단으로
+    # 승격하지 않습니다. 파일명/primer명은 판정에 사용하지 않습니다.
+    if (
+        maximum_adjacent_softclip_mean
+        > MAX_HIGH_QT_INTERNAL_ADJACENT_SOFTCLIP_MEAN
+    ):
+        return False
 
     if (
         low_quality_fraction
@@ -1079,6 +1155,16 @@ def classify_contig_prediction(
     low_quality_fraction = overlap_result[
         "terminal_low_quality_fraction"
     ]
+    maximum_adjacent_softclip_mean = max(
+        overlap_result.get(
+            "forward_junction_softclip_adjacent_mean_quality",
+            0.0,
+        ),
+        overlap_result.get(
+            "reverse_junction_softclip_adjacent_mean_quality",
+            0.0,
+        ),
+    )
     internal_overlap_mode = deep_internal_overlap_mode(
         overlap_result,
         qt_threshold,
@@ -1371,7 +1457,9 @@ def classify_contig_prediction(
                 "장거리 내부 overlap은 강하지만 30/20 말단 제거 "
                 "안정성 기준 미충족(저품질 말단 "
                 f"{low_quality_fraction * 100:.1f}%, gap 포함 Identity "
-                f"{gap_included_identity:.2f}%); F/R 개별 출력 보정 패턴"
+                f"{gap_included_identity:.2f}%, junction 인접 soft-clip "
+                f"최대 평균 Q{maximum_adjacent_softclip_mean:.2f}); "
+                "F/R 개별 출력 보정 패턴"
             ),
         }
 
@@ -1384,7 +1472,10 @@ def classify_contig_prediction(
             "rank": 1,
             "reason": (
                 "25/21 장거리 내부 overlap은 있으나 말단 제거 또는 "
-                "연속 anchor 안정성 기준 미충족; F/R 개별 출력 예상"
+                "연속 anchor 안정성 기준 미충족(junction 인접 "
+                f"soft-clip 최대 평균 Q"
+                f"{maximum_adjacent_softclip_mean:.2f}); "
+                "F/R 개별 출력 예상"
             ),
         }
 
@@ -1664,6 +1755,16 @@ def classify_exploratory_prediction(
     low_quality_fraction = overlap_result[
         "terminal_low_quality_fraction"
     ]
+    maximum_adjacent_softclip_mean = max(
+        overlap_result.get(
+            "forward_junction_softclip_adjacent_mean_quality",
+            0.0,
+        ),
+        overlap_result.get(
+            "reverse_junction_softclip_adjacent_mean_quality",
+            0.0,
+        ),
+    )
     internal_overlap_mode = deep_internal_overlap_mode(
         overlap_result,
         qt_threshold,
@@ -1778,7 +1879,9 @@ def classify_exploratory_prediction(
             "rank": 1,
             "reason": (
                 "장거리 내부 overlap은 강하지만 말단 제거 또는 Q"
-                f"{qt_threshold} 연속 anchor 안정성 기준 미충족"
+                f"{qt_threshold} 연속 anchor 안정성 기준 미충족; "
+                "junction 인접 soft-clip 최대 평균 Q"
+                f"{maximum_adjacent_softclip_mean:.2f}"
             ),
         }
 
@@ -2364,6 +2467,8 @@ def empty_overlap_result():
         "right_head_unaligned": None,
         "terminal_high_quality_bases": None,
         "terminal_low_quality_fraction": 0,
+        "forward_junction_softclip_adjacent_mean_quality": 0,
+        "reverse_junction_softclip_adjacent_mean_quality": 0,
     }
 
 
@@ -2462,6 +2567,14 @@ def evaluate_condition_values(
         "soft-clip 저품질 비율 (%)": round(
             safe_overlap["terminal_low_quality_fraction"] * 100,
             2,
+        ),
+        "Junction 인접 soft-clip 최대 평균 Q": max(
+            safe_overlap[
+                "forward_junction_softclip_adjacent_mean_quality"
+            ],
+            safe_overlap[
+                "reverse_junction_softclip_adjacent_mean_quality"
+            ],
         ),
         "Contig 예측": prediction["status"],
         "인접 성공": "-",
@@ -2776,7 +2889,9 @@ st.caption(
     "고품질 말단이 적으면, 내부 gap이 2 bp 이하로 짧게 분산된 "
     "유형도 별도 성공 패턴으로 평가합니다. 3 bp 이상 연속 gap은 "
     "Contig2 위험으로 구분합니다. 직접 결합형은 최소 75 bp의 "
-    "overlap을 요구합니다. "
+    "overlap을 요구합니다. 장거리 내부 overlap은 정렬 밖 전체 "
+    "말단뿐 아니라 junction에 바로 붙은 60 bp의 평균 Quality도 "
+    "확인하여, 고품질 서열을 잘라야 하는 경우 Contig2로 봅니다. "
     "Primer 파일명은 판정에 사용하지 않고 Reverse 원본과 "
     "reverse-complement를 모두 비교해 정렬 방향을 선택합니다."
 )
@@ -3050,6 +3165,16 @@ if forward_file is not None and reverse_file is not None:
                                 * 100,
                                 2,
                             ),
+                            "Forward junction 인접 60 bp 평균 Q": (
+                                overlap_result[
+                                    "forward_junction_softclip_adjacent_mean_quality"
+                                ]
+                            ),
+                            "Reverse junction 인접 60 bp 평균 Q": (
+                                overlap_result[
+                                    "reverse_junction_softclip_adjacent_mean_quality"
+                                ]
+                            ),
                         }
                     ]
                 )
@@ -3073,6 +3198,7 @@ if forward_file is not None and reverse_file is not None:
 - **Soft-clip 합계**는 위 두 값의 합입니다. 작을수록 두 read가 말단에서 직접 만나지만, 작다는 이유만으로 contig 성공이 확정되지는 않습니다.
 - **경계 기준 이상 soft-clip 염기**는 제외 후보 중 현재 품질 경계 이상인 염기 수입니다. New QT 사용 조건에서는 New QT, 미사용 조건에서는 QT가 경계가 됩니다. 값이 크면 신뢰도 높은 서열을 많이 버려야 하므로 불리합니다.
 - **Soft-clip 저품질 비율**은 제외 후보 중 현재 품질 경계 미만 염기의 비율입니다. 높을수록 말단 제외가 합리적이라는 보조 근거입니다.
+- **Junction 인접 60 bp 평균 Q**는 overlap 바로 바깥에서 제거해야 하는 구간의 평균 품질입니다. 어느 한쪽이라도 Q24를 넘으면 신뢰도 높은 염기를 잘라야 하므로, 장거리 내부 overlap을 성공으로 자동 승격하지 않습니다.
 - **QT 최장 연속 Match**는 양쪽 염기가 모두 현재 QT 이상이면서 정확히 일치하는 구간 중 가장 긴 연속 길이입니다. QT 지지 Match 총량이 많아도 이 값이 짧으면 고품질 anchor가 여러 조각으로 끊긴 상태입니다.
 - **최장 연속 Gap**은 정렬 중 한 번에 연속해서 끊긴 길이입니다. Gap 총량이 비슷해도 이 값이 3 bp 이상이면 한 contig로 합칠 때 연결부 단절 위험을 더 크게 봅니다.
 - **장거리 내부 overlap**은 양쪽 read 끝에 긴 read-through가 남아도 내부에서 250 bp 이상의 강하고 연속적인 overlap이 확인되는 유형입니다. Primer명과 무관하게 평가하며, 일반 terminal overlap보다 엄격한 Identity·gap·anchor 기준을 적용합니다.
