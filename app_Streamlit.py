@@ -870,13 +870,16 @@ MIN_LOW_QT_INTERNAL_CONTIG2_LONGEST_RUN = 30
 # 확장/제외하는 보조 단계가 없습니다. 75 bp 미만의 overlap은 더
 # 엄격한 gap 기준을 만족하는 경우에만 허용하고, 75 bp 이상도 gap
 # 포함 Identity 하한을 적용합니다. MMC(68 bp/gap 4, 실제 미결합)와
-# KCKM1002-4(gap 포함 Identity 87.39%, 실제 미결합) 사례로
-# 보정했습니다.
+# KCKM1002-4(gap 포함 Identity 87.39%, 실제 미결합),
+# MMC-260819-01(75 bp이나 2 bp 연속 gap, 실제 Contig2) 사례로
+# 보정했습니다. New QT 말단 보정이 없으므로 연속 gap은 1 bp까지만
+# 직접 결합 근거로 인정합니다.
 MIN_DIRECT_QT16_OVERLAP = 75
 MIN_QT16_GAP_INCLUDED_IDENTITY = 90
 MIN_SHORT_QT16_OVERLAP = 40
 MIN_SHORT_QT16_GAP_INCLUDED_IDENTITY = 94
 MAX_SHORT_QT16_GAPS = 3
+MAX_QT16_GAP_RUN = 1
 
 # 현재까지 확인된 AB1 쌍의 실제 결과로 보정한 조건별
 # 출력 유형입니다.
@@ -1522,6 +1525,7 @@ def classify_contig_prediction(
         overlap_length >= MIN_DIRECT_QT16_OVERLAP
         and gap_included_identity
         >= MIN_QT16_GAP_INCLUDED_IDENTITY
+        and longest_gap_run <= MAX_QT16_GAP_RUN
     )
 
     qt16_clean_short_overlap = (
@@ -1531,6 +1535,7 @@ def classify_contig_prediction(
         and gap_included_identity
         >= MIN_SHORT_QT16_GAP_INCLUDED_IDENTITY
         and overlap_result["gaps"] <= MAX_SHORT_QT16_GAPS
+        and longest_gap_run <= MAX_QT16_GAP_RUN
     )
 
     qt16_only_success = (
@@ -1644,6 +1649,12 @@ def classify_contig_prediction(
                 "gap 포함 Identity "
                 f"{gap_included_identity:.2f}%로 "
                 f"{MIN_QT16_GAP_INCLUDED_IDENTITY}% 미만"
+            )
+
+        if longest_gap_run > MAX_QT16_GAP_RUN:
+            qt16_reasons.append(
+                f"최장 연속 gap {longest_gap_run} bp로 "
+                f"허용 경계 {MAX_QT16_GAP_RUN} bp 초과"
             )
 
         if not qt16_reasons:
@@ -2884,7 +2895,8 @@ st.caption(
     "보수적으로 보정되어 있으며, 추가 사례에 따라 갱신해야 "
     "합니다. 20계열의 좋은 junction은 성공을 확정하지 않고 "
     "Contig2를 우선합니다. QT16은 New QT 미사용 조건이므로 "
-    "75 bp 미만 overlap과 gap이 많은 정렬을 보수적으로 평가합니다. "
+    "75 bp 미만 overlap, gap이 많은 정렬 및 2 bp 이상 연속 gap을 "
+    "보수적으로 평가합니다. "
     "30/20은 긴 overlap 전체의 유사도가 높고 junction에 남는 "
     "고품질 말단이 적으면, 내부 gap이 2 bp 이하로 짧게 분산된 "
     "유형도 별도 성공 패턴으로 평가합니다. 3 bp 이상 연속 gap은 "
@@ -3200,7 +3212,7 @@ if forward_file is not None and reverse_file is not None:
 - **Soft-clip 저품질 비율**은 제외 후보 중 현재 품질 경계 미만 염기의 비율입니다. 높을수록 말단 제외가 합리적이라는 보조 근거입니다.
 - **Junction 인접 60 bp 평균 Q**는 overlap 바로 바깥에서 제거해야 하는 구간의 평균 품질입니다. 어느 한쪽이라도 Q24를 넘으면 신뢰도 높은 염기를 잘라야 하므로, 장거리 내부 overlap을 성공으로 자동 승격하지 않습니다.
 - **QT 최장 연속 Match**는 양쪽 염기가 모두 현재 QT 이상이면서 정확히 일치하는 구간 중 가장 긴 연속 길이입니다. QT 지지 Match 총량이 많아도 이 값이 짧으면 고품질 anchor가 여러 조각으로 끊긴 상태입니다.
-- **최장 연속 Gap**은 정렬 중 한 번에 연속해서 끊긴 길이입니다. Gap 총량이 비슷해도 이 값이 3 bp 이상이면 한 contig로 합칠 때 연결부 단절 위험을 더 크게 봅니다.
+- **최장 연속 Gap**은 정렬 중 한 번에 연속해서 끊긴 길이입니다. Gap 총량이 비슷해도 연속 Gap이 길면 연결부 단절 위험을 더 크게 봅니다. 특히 New QT 보정이 없는 QT16은 2 bp부터 Contig2 경계로 평가합니다.
 - **장거리 내부 overlap**은 양쪽 read 끝에 긴 read-through가 남아도 내부에서 250 bp 이상의 강하고 연속적인 overlap이 확인되는 유형입니다. Primer명과 무관하게 평가하며, 일반 terminal overlap보다 엄격한 Identity·gap·anchor 기준을 적용합니다.
                         """
                     )
