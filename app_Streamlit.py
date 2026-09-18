@@ -867,24 +867,38 @@ MIN_LOW_QT_INTERNAL_SUCCESS_LONGEST_RUN = 43
 MIN_LOW_QT_INTERNAL_CONTIG2_LONGEST_RUN = 30
 
 # New QT를 사용하지 않는 QT16 조건은 낮은 품질 말단을 별도로
-# 확장/제외하는 보조 단계가 없습니다. 75 bp 미만의 overlap은 더
-# 엄격한 gap 기준을 만족하는 경우에만 허용하고, 75 bp 이상도 gap
-# 포함 Identity 하한을 적용합니다. MMC(68 bp/gap 4, 실제 미결합)와
-# KCKM1002-4(gap 포함 Identity 87.39%, 실제 미결합),
-# MMC-260819-01(75 bp이나 2 bp 연속 gap, 실제 Contig2) 사례로
-# 보정했습니다. New QT 말단 보정이 없으므로 연속 gap은 1 bp까지만
-# 직접 결합 근거로 인정합니다.
+# 확장/제외하는 보조 단계가 없습니다. B-OT-119(74 bp),
+# MMC-260904-02(68 bp), MPHKG-1(69 bp)이 모두 실제 Contig2였으므로
+# 75 bp 미만 overlap의 예외 성공 경로를 제거했습니다. 75 bp
+# 이상도 gap 포함 Identity 하한을 적용하며, MMC-260819-01처럼
+# 2 bp 연속 gap이 확인된 경우는 Contig2로 유지합니다.
 MIN_DIRECT_QT16_OVERLAP = 75
 MIN_QT16_GAP_INCLUDED_IDENTITY = 90
-MIN_SHORT_QT16_OVERLAP = 40
-MIN_SHORT_QT16_GAP_INCLUDED_IDENTITY = 94
-MAX_SHORT_QT16_GAPS = 3
 MAX_QT16_GAP_RUN = 1
+
+# MPHKG-1은 QT16에서 Contig2였지만 단독 QT20에서 실제 결합됐습니다.
+# QT20이 낮은 품질의 짧은 말단을 제외해 주는 패턴을 primer명이 아닌
+# 정렬 구조로 재현합니다. 짧은 overlap의 과대 판정을 막기 위해
+# overlap, Identity, gap, 연속 Quality anchor, 말단 제거 부담을 모두
+# 동시에 만족할 때만 이 QT20 전용 성공 경로를 허용합니다.
+MIN_QT20_TRIMMED_OVERLAP = 60
+MIN_QT20_TRIMMED_BASE_IDENTITY = 98
+MIN_QT20_TRIMMED_GAP_IDENTITY = 94
+MIN_QT20_TRIMMED_WEIGHTED_IDENTITY = 96
+MIN_QT20_TRIMMED_MATCHES = 45
+MIN_QT20_TRIMMED_LONGEST_RUN = 15
+MAX_QT20_TRIMMED_CONFLICTS = 3
+MAX_QT20_TRIMMED_GAPS = 3
+MAX_QT20_TRIMMED_GAP_RUN = 1
+MAX_QT20_TRIMMED_TERMINAL_SLACK = 25
+MIN_QT20_TRIMMED_LOW_QUALITY_FRACTION = 0.95
+MAX_QT20_TRIMMED_ADJACENT_SOFTCLIP_MEAN = 5.5
 
 # 현재까지 확인된 AB1 쌍의 실제 결과로 보정한 조건별
 # 출력 유형입니다.
 # 20계열은 terminal overlap이 좋아 보여도 성공으로 자동 승격하지
-# 않고 F/R 개별 출력(Contig2)을 우선합니다.
+# 않고 F/R 개별 출력(Contig2)을 우선합니다. 단독 QT20의 확인된
+# 저품질 말단 제거형은 아래의 엄격한 구조 기준으로만 예외 처리합니다.
 CONTIG2_CALIBRATED_CONDITIONS = {
     "10",
     "20",
@@ -1515,12 +1529,52 @@ def classify_contig_prediction(
             ),
         }
 
+    # MPHKG-1의 실제 단독 QT20 결합 성공 패턴입니다. QT16에서는
+    # 69 bp의 짧은 overlap이라 Contig2였지만, QT20에서는 junction
+    # 밖의 17 bp가 모두 Q20 미만이고 overlap 내부가 깨끗해 하나의
+    # contig로 결합됐습니다. 파일명/primer명 대신 동일한 정렬 구조와
+    # Quality 경계를 모두 만족하는 경우에만 적용합니다.
+    qt20_trimmed_terminal_success = (
+        condition_label == "20"
+        and reverse_orientation == "Reverse-complement 적용"
+        and overlap_length >= MIN_QT20_TRIMMED_OVERLAP
+        and overlap_result["base_identity"]
+        >= MIN_QT20_TRIMMED_BASE_IDENTITY
+        and gap_included_identity
+        >= MIN_QT20_TRIMMED_GAP_IDENTITY
+        and weighted_identity
+        >= MIN_QT20_TRIMMED_WEIGHTED_IDENTITY
+        and qt_matches >= MIN_QT20_TRIMMED_MATCHES
+        and qt_longest_match_run
+        >= MIN_QT20_TRIMMED_LONGEST_RUN
+        and qt_conflicts <= MAX_QT20_TRIMMED_CONFLICTS
+        and overlap_result["gaps"] <= MAX_QT20_TRIMMED_GAPS
+        and longest_gap_run <= MAX_QT20_TRIMMED_GAP_RUN
+        and total_slack <= MAX_QT20_TRIMMED_TERMINAL_SLACK
+        and terminal_high_quality == 0
+        and low_quality_fraction
+        >= MIN_QT20_TRIMMED_LOW_QUALITY_FRACTION
+        and maximum_adjacent_softclip_mean
+        <= MAX_QT20_TRIMMED_ADJACENT_SOFTCLIP_MEAN
+    )
+
+    if qt20_trimmed_terminal_success:
+        return {
+            "status": "F+R 결합 성공 예상",
+            "rank": 2,
+            "reason": (
+                "QT20 저품질 말단 제거형 성공 패턴 충족; "
+                f"terminal overlap {overlap_length} bp, "
+                f"Q20 최장 연속 match {qt_longest_match_run} bp"
+            ),
+        }
+
     # 16S 기본값인 QT16 단독 조건입니다. New QT를 사용하지 않고
     # QT16을 말단 품질 경계로 삼아 구조적 overlap을 평가합니다.
     # New QT의 말단 보정이 없으므로 75 bp 이상의 직접 overlap과
-    # gap 포함 Identity 90% 이상을 함께 요구합니다. 다만 기존에
-    # 일치했던 짧고 깨끗한 overlap 사례는 gap 포함 Identity 94%
-    # 이상, gap 3개 이하일 때만 별도로 허용합니다.
+    # gap 포함 Identity 90% 이상을 함께 요구합니다. 실제 Contig2가
+    # 반복 확인된 75 bp 미만 overlap은 별도 예외 없이 보수적으로
+    # F/R 개별 출력으로 분류합니다.
     qt16_direct_overlap = (
         overlap_length >= MIN_DIRECT_QT16_OVERLAP
         and gap_included_identity
@@ -1528,22 +1582,9 @@ def classify_contig_prediction(
         and longest_gap_run <= MAX_QT16_GAP_RUN
     )
 
-    qt16_clean_short_overlap = (
-        MIN_SHORT_QT16_OVERLAP
-        <= overlap_length
-        < MIN_DIRECT_QT16_OVERLAP
-        and gap_included_identity
-        >= MIN_SHORT_QT16_GAP_INCLUDED_IDENTITY
-        and overlap_result["gaps"] <= MAX_SHORT_QT16_GAPS
-        and longest_gap_run <= MAX_QT16_GAP_RUN
-    )
-
     qt16_only_success = (
         condition_label == "16"
-        and (
-            qt16_direct_overlap
-            or qt16_clean_short_overlap
-        )
+        and qt16_direct_overlap
         and overlap_result["base_identity"] >= 97
         and weighted_identity >= 90
         and qt_matches >= 25
@@ -1608,36 +1649,11 @@ def classify_contig_prediction(
     if condition_label == "16":
         qt16_reasons = []
 
-        if overlap_length < MIN_SHORT_QT16_OVERLAP:
+        if overlap_length < MIN_DIRECT_QT16_OVERLAP:
             qt16_reasons.append(
                 f"terminal overlap {overlap_length} bp로 "
-                f"{MIN_SHORT_QT16_OVERLAP} bp 미만"
+                f"직접 결합 하한 {MIN_DIRECT_QT16_OVERLAP} bp 미만"
             )
-
-        elif overlap_length < MIN_DIRECT_QT16_OVERLAP:
-            short_failures = []
-
-            if (
-                gap_included_identity
-                < MIN_SHORT_QT16_GAP_INCLUDED_IDENTITY
-            ):
-                short_failures.append(
-                    "gap 포함 Identity "
-                    f"{gap_included_identity:.2f}%"
-                )
-
-            if overlap_result["gaps"] > MAX_SHORT_QT16_GAPS:
-                short_failures.append(
-                    f"gap {overlap_result['gaps']}개"
-                )
-
-            if short_failures:
-                qt16_reasons.append(
-                    f"{MIN_DIRECT_QT16_OVERLAP} bp 미만 overlap의 "
-                    "엄격 기준 미충족("
-                    + ", ".join(short_failures)
-                    + ")"
-                )
 
         if (
             overlap_length >= MIN_DIRECT_QT16_OVERLAP
@@ -2893,10 +2909,12 @@ st.caption(
     "30/40과 단독 10도 유효한 독립 조건입니다. 현재 조건별 "
     "출력 유형은 현재까지 확인된 AB1 쌍의 실제 결과를 기준으로 "
     "보수적으로 보정되어 있으며, 추가 사례에 따라 갱신해야 "
-    "합니다. 20계열의 좋은 junction은 성공을 확정하지 않고 "
-    "Contig2를 우선합니다. QT16은 New QT 미사용 조건이므로 "
-    "75 bp 미만 overlap, gap이 많은 정렬 및 2 bp 이상 연속 gap을 "
-    "보수적으로 평가합니다. "
+    "합니다. 20계열의 좋은 junction은 원칙적으로 Contig2를 "
+    "우선하지만, 단독 QT20은 overlap 내부가 매우 깨끗하고 junction "
+    "밖의 짧은 말단이 모두 Q20 미만인 확인된 구조에 한해 성공으로 "
+    "평가합니다. QT16은 New QT 미사용 조건이므로 75 bp 미만 "
+    "overlap을 Contig2로 분류하고, 75 bp 이상에서도 gap이 많은 "
+    "정렬 및 2 bp 이상 연속 gap을 보수적으로 평가합니다. "
     "30/20은 긴 overlap 전체의 유사도가 높고 junction에 남는 "
     "고품질 말단이 적으면, 내부 gap이 2 bp 이하로 짧게 분산된 "
     "유형도 별도 성공 패턴으로 평가합니다. 3 bp 이상 연속 gap은 "
@@ -3213,6 +3231,7 @@ if forward_file is not None and reverse_file is not None:
 - **Junction 인접 60 bp 평균 Q**는 overlap 바로 바깥에서 제거해야 하는 구간의 평균 품질입니다. 어느 한쪽이라도 Q24를 넘으면 신뢰도 높은 염기를 잘라야 하므로, 장거리 내부 overlap을 성공으로 자동 승격하지 않습니다.
 - **QT 최장 연속 Match**는 양쪽 염기가 모두 현재 QT 이상이면서 정확히 일치하는 구간 중 가장 긴 연속 길이입니다. QT 지지 Match 총량이 많아도 이 값이 짧으면 고품질 anchor가 여러 조각으로 끊긴 상태입니다.
 - **최장 연속 Gap**은 정렬 중 한 번에 연속해서 끊긴 길이입니다. Gap 총량이 비슷해도 연속 Gap이 길면 연결부 단절 위험을 더 크게 봅니다. 특히 New QT 보정이 없는 QT16은 2 bp부터 Contig2 경계로 평가합니다.
+- **단독 QT20 저품질 말단 제거형**은 짧은 terminal overlap이라도 Identity와 Q20 anchor가 높고, junction 밖 말단이 모두 Q20 미만이며 gap이 짧게 분산된 경우입니다. 현재 확인된 실제 성공 구조에만 제한적으로 적용합니다.
 - **장거리 내부 overlap**은 양쪽 read 끝에 긴 read-through가 남아도 내부에서 250 bp 이상의 강하고 연속적인 overlap이 확인되는 유형입니다. Primer명과 무관하게 평가하며, 일반 terminal overlap보다 엄격한 Identity·gap·anchor 기준을 적용합니다.
                         """
                     )
