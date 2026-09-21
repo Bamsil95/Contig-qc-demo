@@ -783,7 +783,7 @@ def analyze_best_reverse_orientation(
     if not candidates:
         return None
 
-    return min(
+    best_candidate = min(
         candidates,
         key=lambda candidate: (
             0 if candidate["candidate_is_usable"] else 1,
@@ -795,6 +795,58 @@ def analyze_best_reverse_orientation(
             -candidate["paired_bases"],
         ),
     )
+
+    def read_level_metrics(sequence, qualities):
+        normalized_qualities = normalize_quality_scores(
+            sequence,
+            qualities,
+        )
+        read_length = len(sequence)
+
+        if read_length:
+            mean_quality = sum(normalized_qualities) / read_length
+            q20_fraction = sum(
+                quality >= 20
+                for quality in normalized_qualities
+            ) / read_length
+            q30_fraction = sum(
+                quality >= 30
+                for quality in normalized_qualities
+            ) / read_length
+        else:
+            mean_quality = 0.0
+            q20_fraction = 0.0
+            q30_fraction = 0.0
+
+        qt_readthrough = estimate_quality_readthrough(
+            normalized_qualities,
+            threshold=qt_threshold,
+        )
+
+        return {
+            "read_length": read_length,
+            "mean_quality": round(mean_quality, 2),
+            "q20_fraction": round(q20_fraction, 4),
+            "q30_fraction": round(q30_fraction, 4),
+            "qt_readthrough": qt_readthrough,
+        }
+
+    forward_metrics = read_level_metrics(
+        forward_sequence,
+        forward_qualities,
+    )
+    reverse_metrics = read_level_metrics(
+        reverse_sequence,
+        reverse_qualities,
+    )
+
+    for key, value in forward_metrics.items():
+        best_candidate[f"forward_{key}"] = value
+
+    for key, value in reverse_metrics.items():
+        best_candidate[f"reverse_{key}"] = value
+
+    return best_candidate
 
 
 # --------------------------------------------------
@@ -869,9 +921,11 @@ MIN_LOW_QT_INTERNAL_CONTIG2_LONGEST_RUN = 30
 # New QT를 사용하지 않는 QT16 조건은 낮은 품질 말단을 별도로
 # 확장/제외하는 보조 단계가 없습니다. B-OT-119(74 bp),
 # MMC-260904-02(68 bp), MPHKG-1(69 bp)이 모두 실제 Contig2였으므로
-# 75 bp 미만 overlap의 예외 성공 경로를 제거했습니다. 75 bp
-# 이상도 gap 포함 Identity 하한을 적용하며, MMC-260819-01처럼
-# 2 bp 연속 gap이 확인된 경우는 Contig2로 유지합니다.
+# 일반적인 75 bp 미만 overlap의 성공 승격은 막습니다. 다만 전체
+# read 길이와 Quality가 실제 성공군의 사전 정리형 구조까지 충족하면
+# 아래의 별도 read-level 예외로 평가합니다. 75 bp 이상도 gap 포함
+# Identity 하한을 적용하며, MMC-260819-01처럼 2 bp 연속 gap이
+# 확인된 경우는 Contig2로 유지합니다.
 MIN_DIRECT_QT16_OVERLAP = 75
 MIN_QT16_GAP_INCLUDED_IDENTITY = 90
 MAX_QT16_GAP_RUN = 1
@@ -893,6 +947,45 @@ MAX_QT20_TRIMMED_GAP_RUN = 1
 MAX_QT20_TRIMMED_TERMINAL_SLACK = 25
 MIN_QT20_TRIMMED_LOW_QUALITY_FRACTION = 0.95
 MAX_QT20_TRIMMED_ADJACENT_SOFTCLIP_MEAN = 5.5
+
+# CW1IE-5의 두 785F 반응은 같은 907R과 65 bp overlap을 만들지만,
+# 원본 read 길이와 전체 Quality 구조에 따라 실제 결과가 달랐습니다.
+# 한쪽 read가 이미 짧고 매우 깨끗하며 다른 쪽은 긴 구조인 경우에는
+# 낮은 QT에서도 안정적으로 결합됐습니다. 반대로 양쪽에 긴 저품질
+# tail이 남은 구조는 QT30/New QT20에서만 결합됐습니다. 파일명이나
+# primer명이 아니라 raw read 길이, 전체 Quality, QT read-through와
+# junction 지표를 함께 사용해 두 유형을 구분합니다.
+MIN_SHORT_TERMINAL_OVERLAP = 60
+MAX_SHORT_TERMINAL_OVERLAP = 74
+MIN_PRETRIMMED_BASE_IDENTITY = 96
+MIN_PRETRIMMED_GAP_IDENTITY = 90
+MIN_PRETRIMMED_WEIGHTED_IDENTITY = 93
+MIN_PRETRIMMED_QT_MATCHES = 30
+MIN_PRETRIMMED_LONGEST_RUN = 9
+MAX_PRETRIMMED_CONFLICTS = 5
+MAX_PRETRIMMED_GAPS = 5
+MAX_PRETRIMMED_GAP_RUN = 1
+MAX_PRETRIMMED_TERMINAL_SLACK = 20
+MAX_PRETRIMMED_TERMINAL_HIGH_QUALITY = 1
+MIN_PRETRIMMED_READ_LENGTH_ASYMMETRY = 300
+MAX_PRETRIMMED_SHORT_READ_LENGTH = 1150
+MIN_PRETRIMMED_LONG_READ_LENGTH = 1300
+MIN_PRETRIMMED_SHORT_READ_MEAN_QUALITY = 40
+MIN_PRETRIMMED_LONG_READ_MEAN_QUALITY = 35
+MIN_PRETRIMMED_Q30_FRACTION = 0.50
+MIN_PRETRIMMED_QT_READTHROUGH = 650
+
+MIN_DUAL_LONG_QT30_READ_LENGTH = 1300
+MIN_DUAL_LONG_QT30_READTHROUGH = 650
+MIN_DUAL_LONG_QT30_BASE_IDENTITY = 98
+MIN_DUAL_LONG_QT30_GAP_IDENTITY = 91
+MIN_DUAL_LONG_QT30_WEIGHTED_IDENTITY = 94
+MIN_DUAL_LONG_QT30_MATCHES = 30
+MIN_DUAL_LONG_QT30_LONGEST_RUN = 8
+MAX_DUAL_LONG_QT30_CONFLICTS = 5
+MAX_DUAL_LONG_QT30_GAPS = 5
+MAX_DUAL_LONG_QT30_GAP_RUN = 1
+MAX_DUAL_LONG_QT30_TERMINAL_SLACK = 20
 
 # 현재까지 확인된 AB1 쌍의 실제 결과로 보정한 조건별
 # 출력 유형입니다.
@@ -1351,11 +1444,154 @@ def classify_contig_prediction(
         "",
     )
 
+    read_profiles = sorted(
+        [
+            {
+                "length": overlap_result.get(
+                    "forward_read_length",
+                    0,
+                ),
+                "mean_quality": overlap_result.get(
+                    "forward_mean_quality",
+                    0.0,
+                ),
+                "q30_fraction": overlap_result.get(
+                    "forward_q30_fraction",
+                    0.0,
+                ),
+                "qt_readthrough": overlap_result.get(
+                    "forward_qt_readthrough",
+                    0,
+                ),
+            },
+            {
+                "length": overlap_result.get(
+                    "reverse_read_length",
+                    0,
+                ),
+                "mean_quality": overlap_result.get(
+                    "reverse_mean_quality",
+                    0.0,
+                ),
+                "q30_fraction": overlap_result.get(
+                    "reverse_q30_fraction",
+                    0.0,
+                ),
+                "qt_readthrough": overlap_result.get(
+                    "reverse_qt_readthrough",
+                    0,
+                ),
+            },
+        ],
+        key=lambda profile: profile["length"],
+    )
+    shorter_read, longer_read = read_profiles
+    read_length_asymmetry = (
+        longer_read["length"] - shorter_read["length"]
+    )
+
+    short_terminal_alignment = (
+        MIN_SHORT_TERMINAL_OVERLAP
+        <= overlap_length
+        <= MAX_SHORT_TERMINAL_OVERLAP
+        and overlap_result["base_identity"]
+        >= MIN_PRETRIMMED_BASE_IDENTITY
+        and gap_included_identity
+        >= MIN_PRETRIMMED_GAP_IDENTITY
+        and weighted_identity
+        >= MIN_PRETRIMMED_WEIGHTED_IDENTITY
+        and qt_matches >= MIN_PRETRIMMED_QT_MATCHES
+        and qt_longest_match_run
+        >= MIN_PRETRIMMED_LONGEST_RUN
+        and qt_conflicts <= MAX_PRETRIMMED_CONFLICTS
+        and overlap_result["gaps"] <= MAX_PRETRIMMED_GAPS
+        and longest_gap_run <= MAX_PRETRIMMED_GAP_RUN
+        and total_slack <= MAX_PRETRIMMED_TERMINAL_SLACK
+        and terminal_high_quality
+        <= MAX_PRETRIMMED_TERMINAL_HIGH_QUALITY
+    )
+
+    # 한쪽 read가 이미 짧고 깨끗하게 정리된 반면 반대쪽 read는 긴
+    # 비대칭 구조입니다. 두 read 모두 충분한 Q30 비율과 QT
+    # read-through를 가지면 75 bp 미만 overlap도 실제 프로그램에서
+    # 낮은 QT부터 결합될 수 있습니다.
+    pretrimmed_asymmetric_terminal_success = (
+        reverse_orientation == "Reverse-complement 적용"
+        and short_terminal_alignment
+        and read_length_asymmetry
+        >= MIN_PRETRIMMED_READ_LENGTH_ASYMMETRY
+        and shorter_read["length"]
+        <= MAX_PRETRIMMED_SHORT_READ_LENGTH
+        and longer_read["length"]
+        >= MIN_PRETRIMMED_LONG_READ_LENGTH
+        and shorter_read["mean_quality"]
+        >= MIN_PRETRIMMED_SHORT_READ_MEAN_QUALITY
+        and longer_read["mean_quality"]
+        >= MIN_PRETRIMMED_LONG_READ_MEAN_QUALITY
+        and min(
+            shorter_read["q30_fraction"],
+            longer_read["q30_fraction"],
+        )
+        >= MIN_PRETRIMMED_Q30_FRACTION
+        and min(
+            shorter_read["qt_readthrough"],
+            longer_read["qt_readthrough"],
+        )
+        >= MIN_PRETRIMMED_QT_READTHROUGH
+    )
+
+    # 양쪽 raw read가 모두 길어 낮은 QT에서는 저품질 tail이 남지만,
+    # Q30 core가 각각 650 bp 이상 유지되고 junction이 깨끗한 경우의
+    # 30/20 전용 short-overlap rescue입니다.
+    dual_long_qt30_short_overlap_success = (
+        condition_label == "30/20"
+        and reverse_orientation == "Reverse-complement 적용"
+        and MIN_SHORT_TERMINAL_OVERLAP
+        <= overlap_length
+        <= MAX_SHORT_TERMINAL_OVERLAP
+        and shorter_read["length"]
+        >= MIN_DUAL_LONG_QT30_READ_LENGTH
+        and min(
+            shorter_read["qt_readthrough"],
+            longer_read["qt_readthrough"],
+        )
+        >= MIN_DUAL_LONG_QT30_READTHROUGH
+        and overlap_result["base_identity"]
+        >= MIN_DUAL_LONG_QT30_BASE_IDENTITY
+        and gap_included_identity
+        >= MIN_DUAL_LONG_QT30_GAP_IDENTITY
+        and weighted_identity
+        >= MIN_DUAL_LONG_QT30_WEIGHTED_IDENTITY
+        and qt_matches >= MIN_DUAL_LONG_QT30_MATCHES
+        and qt_longest_match_run
+        >= MIN_DUAL_LONG_QT30_LONGEST_RUN
+        and qt_conflicts <= MAX_DUAL_LONG_QT30_CONFLICTS
+        and overlap_result["gaps"] <= MAX_DUAL_LONG_QT30_GAPS
+        and longest_gap_run <= MAX_DUAL_LONG_QT30_GAP_RUN
+        and total_slack
+        <= MAX_DUAL_LONG_QT30_TERMINAL_SLACK
+        and terminal_high_quality == 0
+    )
+
+    if (
+        condition_label in {"16", "20", "20/10"}
+        and pretrimmed_asymmetric_terminal_success
+    ):
+        return {
+            "status": "F+R 결합 성공 예상",
+            "rank": 2,
+            "reason": (
+                f"{condition_label} 사전 정리된 비대칭 read 성공 "
+                f"패턴 충족; terminal overlap {overlap_length} bp, "
+                f"read 길이 {shorter_read['length']}/"
+                f"{longer_read['length']} bp"
+            ),
+        }
+
     # 현재 확인된 NS1/NS24 및 785F/907R 성공 패턴입니다.
-    # 짧은 overlap은 말단 품질이 좋아도 회사 프로그램에서
-    # Contig2로 남을 수 있으므로, 직접 결합형에는 최소 75 bp의
-    # overlap을 요구합니다. 긴 저품질 말단 rescue 유형은 별도로
-    # 평가합니다.
+    # 일반 직접 결합형에는 최소 75 bp overlap을 요구합니다. 다만
+    # 위에서 확인한 사전 정리형 및 양쪽 긴 read의 Q30 core rescue는
+    # 전체 read 구조가 함께 충족될 때만 별도로 평가합니다.
     direct_30_20_success = (
         overlap_length >= MIN_DIRECT_30_20_OVERLAP
         and qt_longest_match_run >= 8
@@ -1370,9 +1606,24 @@ def classify_contig_prediction(
             or low_quality_terminal_rescue
             or long_gapped_30_20_success
             or internal_overlap_mode is not None
+            or pretrimmed_asymmetric_terminal_success
+            or dual_long_qt30_short_overlap_success
         )
     ):
-        if internal_overlap_mode is not None:
+        if pretrimmed_asymmetric_terminal_success:
+            success_basis = (
+                "30/20 사전 정리된 비대칭 read 성공 패턴 충족; "
+                f"terminal overlap {overlap_length} bp, read 길이 "
+                f"{shorter_read['length']}/{longer_read['length']} bp"
+            )
+        elif dual_long_qt30_short_overlap_success:
+            success_basis = (
+                "30/20 양쪽 긴 read의 고품질 core 성공 패턴 충족; "
+                f"terminal overlap {overlap_length} bp, Q30 "
+                f"read-through {shorter_read['qt_readthrough']}/"
+                f"{longer_read['qt_readthrough']} bp"
+            )
+        elif internal_overlap_mode is not None:
             success_basis = (
                 f"30/20 {internal_overlap_mode} 성공 패턴 충족; "
                 f"Q{qt_threshold} 최장 연속 match "
@@ -1571,10 +1822,10 @@ def classify_contig_prediction(
 
     # 16S 기본값인 QT16 단독 조건입니다. New QT를 사용하지 않고
     # QT16을 말단 품질 경계로 삼아 구조적 overlap을 평가합니다.
-    # New QT의 말단 보정이 없으므로 75 bp 이상의 직접 overlap과
-    # gap 포함 Identity 90% 이상을 함께 요구합니다. 실제 Contig2가
-    # 반복 확인된 75 bp 미만 overlap은 별도 예외 없이 보수적으로
-    # F/R 개별 출력으로 분류합니다.
+    # 일반형은 75 bp 이상의 직접 overlap과 gap 포함 Identity 90%
+    # 이상을 함께 요구합니다. 75 bp 미만은 앞에서 전체 read가 이미
+    # 짧고 깨끗하게 정리된 비대칭 성공 구조를 충족한 경우에만 먼저
+    # 성공 처리되며, 그 외에는 F/R 개별 출력으로 분류합니다.
     qt16_direct_overlap = (
         overlap_length >= MIN_DIRECT_QT16_OVERLAP
         and gap_included_identity
@@ -2912,14 +3163,18 @@ st.caption(
     "합니다. 20계열의 좋은 junction은 원칙적으로 Contig2를 "
     "우선하지만, 단독 QT20은 overlap 내부가 매우 깨끗하고 junction "
     "밖의 짧은 말단이 모두 Q20 미만인 확인된 구조에 한해 성공으로 "
-    "평가합니다. QT16은 New QT 미사용 조건이므로 75 bp 미만 "
-    "overlap을 Contig2로 분류하고, 75 bp 이상에서도 gap이 많은 "
-    "정렬 및 2 bp 이상 연속 gap을 보수적으로 평가합니다. "
+    "평가합니다. QT16은 75 bp 미만 overlap을 원칙적으로 Contig2로 "
+    "분류하지만, 한쪽 read가 짧고 전체 Quality가 높게 사전 정리된 "
+    "실제 성공 구조는 read 전체 지표를 함께 확인해 예외 처리합니다. "
+    "75 bp 이상에서도 gap이 많은 정렬 및 2 bp 이상 연속 gap은 "
+    "보수적으로 평가합니다. "
     "30/20은 긴 overlap 전체의 유사도가 높고 junction에 남는 "
     "고품질 말단이 적으면, 내부 gap이 2 bp 이하로 짧게 분산된 "
     "유형도 별도 성공 패턴으로 평가합니다. 3 bp 이상 연속 gap은 "
-    "Contig2 위험으로 구분합니다. 직접 결합형은 최소 75 bp의 "
-    "overlap을 요구합니다. 장거리 내부 overlap은 정렬 밖 전체 "
+    "Contig2 위험으로 구분합니다. 일반 직접 결합형은 최소 75 bp의 "
+    "overlap을 요구하며, 75 bp 미만은 확인된 전체 read 구조까지 "
+    "충족한 경우에만 제한적으로 성공 처리합니다. 장거리 내부 "
+    "overlap은 정렬 밖 전체 "
     "말단뿐 아니라 junction에 바로 붙은 60 bp의 평균 Quality도 "
     "확인하여, 고품질 서열을 잘라야 하는 경우 Contig2로 봅니다. "
     "Primer 파일명은 판정에 사용하지 않고 Reverse 원본과 "
@@ -3232,6 +3487,8 @@ if forward_file is not None and reverse_file is not None:
 - **QT 최장 연속 Match**는 양쪽 염기가 모두 현재 QT 이상이면서 정확히 일치하는 구간 중 가장 긴 연속 길이입니다. QT 지지 Match 총량이 많아도 이 값이 짧으면 고품질 anchor가 여러 조각으로 끊긴 상태입니다.
 - **최장 연속 Gap**은 정렬 중 한 번에 연속해서 끊긴 길이입니다. Gap 총량이 비슷해도 연속 Gap이 길면 연결부 단절 위험을 더 크게 봅니다. 특히 New QT 보정이 없는 QT16은 2 bp부터 Contig2 경계로 평가합니다.
 - **단독 QT20 저품질 말단 제거형**은 짧은 terminal overlap이라도 Identity와 Q20 anchor가 높고, junction 밖 말단이 모두 Q20 미만이며 gap이 짧게 분산된 경우입니다. 현재 확인된 실제 성공 구조에만 제한적으로 적용합니다.
+- **사전 정리된 비대칭 read형**은 한쪽 read가 짧고 평균 Quality가 높으며 반대쪽 read는 길지만 충분한 Q30 구간을 유지하는 구조입니다. overlap이 75 bp 미만이어도 전체 read와 junction 기준을 모두 통과하면 확인된 표준 조건에서 성공으로 평가합니다.
+- **양쪽 긴 read의 Q30 core형**은 낮은 QT에서 긴 저품질 tail이 남아 Contig2가 되지만, 양쪽 Q30 read-through가 충분하면 30/20에서만 짧은 overlap을 제한적으로 사용할 수 있는 구조입니다.
 - **장거리 내부 overlap**은 양쪽 read 끝에 긴 read-through가 남아도 내부에서 250 bp 이상의 강하고 연속적인 overlap이 확인되는 유형입니다. Primer명과 무관하게 평가하며, 일반 terminal overlap보다 엄격한 Identity·gap·anchor 기준을 적용합니다.
                         """
                     )
