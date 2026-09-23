@@ -1,4081 +1,741 @@
+"""Contig 조건 비교: QT / New QT on-off / Window size를 분리한 버전.
+
+실행: python -m streamlit run "app_Streamlit(5).py"
+설치(Python 3.10 이상): python -m pip install streamlit pandas biopython
+
+2026-09-23 사용자 확인: 20/10의 10은 Window size이며 Q10이 아니다.
+회사 엔진: phrap 0.990319. 회사 trimming 구현과 실행 옵션은 미제공.
+따라서 이전의 조건별 성공/Contig2 예외 규칙은 사용하지 않는다.
+AB1 참고 분석의 trimming은 아래에 명시한 가정이며, 실제 회사 규칙이 아니다.
+실제 phrap 실행 결과는 ACE의 F/R read 소속을 확인해서만 표시한다.
+"""
+
+from __future__ import annotations
+
+import hashlib
 import io
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import tempfile
+import zipfile
+from dataclasses import asdict, dataclass
+from pathlib import Path, PurePosixPath
 
 import pandas as pd
 import streamlit as st
 from Bio import SeqIO
-from Bio.Seq import Seq
 from Bio.Align import PairwiseAligner
+from Bio.Seq import Seq
+from Bio.Sequencing import Ace
 
-APP_VERSION = "2026.09.23"
+APP_VERSION = "2026.09.23-window-v1"
+TARGET_PHRAP_VERSION = "0.990319"
+MAX_READ_BASES = 5000
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+PREVIEW_METHODS = {
+    "mean_q": "평균 Quality 기준 · 시범 가정",
+    "mean_error": "평균 오류확률 기준 · 시범 가정",
+}
 
-# --------------------------------------------------
-# 페이지 설정
-# --------------------------------------------------
-st.set_page_config(
-    page_title="Contig QC Demo",
-    page_icon="🧬",
-    layout="wide",
+
+@dataclass(frozen=True)
+class Condition:
+    label: str
+    qt: int
+    new_qt_enabled: bool
+    window_size: int | None
+    second_qt_enabled: bool = False
+
+    def __post_init__(self):
+        if not 1 <= self.qt <= 60:
+            raise ValueError("QT는 1~60 사이여야 합니다.")
+        if self.new_qt_enabled:
+            if type(self.window_size) is not int or self.window_size < 1:
+                raise ValueError("New QT 사용 시 양의 정수 Window size가 필요합니다.")
+        elif self.window_size is not None:
+            raise ValueError("New QT 미사용 시 Window size는 적용하지 않습니다.")
+
+    @property
+    def key(self):
+        return self.label.replace("/", "_")
+
+
+# 화면 표기 16/0·10/0의 0은 New QT 해제의 약식 표기이다.
+# 2nd QT는 제시된 화면처럼 네 조건 모두 해제한다. 알고리즘은 미확인.
+CONDITIONS = (
+    Condition("16", 16, False, None),
+    Condition("20/10", 20, True, 10),
+    Condition("30/20", 30, True, 20),
+    Condition("10", 10, False, None),
 )
 
 
-# --------------------------------------------------
-# AB1 파일 읽기
-# --------------------------------------------------
-def read_ab1(uploaded_file):
-    file_bytes = uploaded_file.getvalue()
-    file_handle = io.BytesIO(file_bytes)
+@dataclass(frozen=True)
+class Read:
+    name: str
+    sequence: str
+    qualities: tuple[int, ...]
+    file_name: str = ""
+    source_sha256: str = ""
 
-    record = SeqIO.read(file_handle, "abi")
+    def __post_init__(self):
+        if not self.name or re.search(r"\s", self.name):
+            raise ValueError("Read ID는 공백 없는 문자열이어야 합니다.")
+        if len(self.sequence) > MAX_READ_BASES:
+            raise ValueError(f"이 도구는 read당 {MAX_READ_BASES:,} bp 이하의 F/R 쌍을 지원합니다.")
+        if len(self.qualities) != len(self.sequence):
+            raise ValueError("서열과 Quality 길이가 다릅니다. 누락 Quality를 임의로 채우지 않습니다.")
+        if any(type(q) is not int or not 0 <= q <= 99 for q in self.qualities):
+            raise ValueError("Quality에는 0~99의 정수만 사용할 수 있습니다.")
+        if set(self.sequence.upper()) - set("ACGTRYSWKMBDHVNX"):
+            raise ValueError("DNA 서열에 지원하지 않는 문자가 있습니다.")
 
-    sequence = str(record.seq).upper()
-    quality_scores = list(
-        record.letter_annotations.get("phred_quality", [])
-    )
 
-    return {
-        "file_name": uploaded_file.name,
-        "record_id": record.id,
-        "sequence": sequence,
-        "quality_scores": quality_scores,
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def read_ab1(data: bytes, filename: str, read_id: str) -> Read:
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ValueError("AB1 파일이 20 MiB를 초과합니다.")
+    record = SeqIO.read(io.BytesIO(data), "abi")
+    qualities = record.letter_annotations.get("phred_quality")
+    if qualities is None:
+        raise ValueError(f"{filename}: 염기별 Quality가 없습니다.")
+    return Read(read_id, str(record.seq).upper(), tuple(qualities), filename, sha256(data))
+
+
+def preview_trim(read: Read, condition: Condition, method="mean_q"):
+    """회사 구현 미확인 상태에서 비교용으로만 사용하는 명시적 가정.
+
+    New QT off: 개별 Q가 QT 이상인 첫/마지막 염기 사이를 유지한다.
+    New QT on: Window size개 염기를 1 bp씩 이동해 평가하고 통과한
+    첫 window 시작~마지막 window 끝을 유지한다. 내부 저품질 염기는
+    삭제하지 않는다. 실제 회사의 시작/종료점·재탐색 규칙과 다를 수 있다.
+    """
+    if condition.second_qt_enabled:
+        raise ValueError("2nd QT 알고리즘이 확인되지 않아 시범 계산을 지원하지 않습니다.")
+    if method not in PREVIEW_METHODS:
+        raise ValueError("지원하지 않는 시범 trimming 방식입니다.")
+    width = condition.window_size if condition.new_qt_enabled else 1
+    n = len(read.sequence)
+    start = end = 0
+    if n >= width:
+        values = (
+            list(read.qualities) if method == "mean_q"
+            else [10 ** (-q / 10.0) for q in read.qualities]
+        )
+        running = math.fsum(values[:width])
+        passing = []
+        cutoff = condition.qt if method == "mean_q" else 10 ** (-condition.qt / 10.0)
+        for index in range(n - width + 1):
+            average = running / width
+            passes = (
+                average >= cutoff - 1e-12 if method == "mean_q"
+                else average <= cutoff + 1e-15
+            )
+            if passes:
+                passing.append(index)
+            if index + width < n:
+                running += values[index + width] - values[index]
+        if passing:
+            start, end = passing[0], passing[-1] + width
+    trimmed = Read(read.name, read.sequence[start:end], read.qualities[start:end],
+                   read.file_name, read.source_sha256)
+    return trimmed, {
+        "source": "preview_assumption",
+        "start_1based": start + 1 if end > start else None,
+        "end_1based": end if end > start else None,
+        "original_bases": n,
+        "retained_bases": end - start,
+        "removed_head": start if end > start else n,
+        "removed_tail": n - end if end > start else 0,
+        "effective_preview_window": width,
+        "method": method,
+        "note": "회사 전처리와 일치 여부 미확인",
     }
 
 
-# --------------------------------------------------
-# AB1 요약
-# --------------------------------------------------
-def make_summary(read_data, direction):
-    sequence = read_data["sequence"]
-    qualities = read_data["quality_scores"]
+def encode_fasta_qual(reads):
+    fasta, qual = [], []
+    for read in reads:
+        fasta.append(f">{read.name}\n{read.sequence}\n")
+        qual.append(f">{read.name}\n{' '.join(map(str, read.qualities))}\n")
+    return "".join(fasta).encode(), "".join(qual).encode()
 
-    if qualities:
-        average_quality = sum(qualities) / len(qualities)
-        q20_count = sum(q >= 20 for q in qualities)
-        q30_count = sum(q >= 30 for q in qualities)
-    else:
-        average_quality = None
-        q20_count = 0
-        q30_count = 0
 
+def decode_fasta_qual(fasta: bytes, qual: bytes):
+    """실제 실행 입력은 원본 bytes로 보존하고, 검증/참고 정렬만 파싱한다."""
+    seq_records = list(SeqIO.parse(io.StringIO(fasta.decode("utf-8-sig")), "fasta"))
+    qual_records = list(SeqIO.parse(io.StringIO(qual.decode("utf-8-sig")), "qual"))
+    if len(seq_records) != 2 or len(qual_records) != 2:
+        raise ValueError("각 조건의 FASTA와 QUAL에는 정확히 두 read가 있어야 합니다.")
+    if len({r.id for r in seq_records}) != 2:
+        raise ValueError("FASTA의 두 read ID가 중복됩니다.")
+    reads = []
+    for seq, quality in zip(seq_records, qual_records):
+        if seq.id != quality.id:
+            raise ValueError("FASTA와 QUAL의 read ID 및 순서가 일치해야 합니다.")
+        reads.append(Read(seq.id, str(seq.seq), tuple(quality.letter_annotations["phred_quality"])))
+    return tuple(reads)
+
+
+def input_packet(condition, reads, source, trim_metadata=None, raw_bytes=None):
+    fasta, qual = raw_bytes if raw_bytes is not None else encode_fasta_qual(reads)
     return {
-        "방향": direction,
-        "파일명": read_data["file_name"],
-        "Read 길이": len(sequence),
-        "평균 Quality": (
-            round(average_quality, 2)
-            if average_quality is not None
-            else "없음"
-        ),
-        "Q20 이상 염기 수": q20_count,
-        "Q30 이상 염기 수": q30_count,
+        "condition": asdict(condition),
+        "reads": reads,
+        "input_source": source,
+        "trim_metadata": trim_metadata or [],
+        "fasta": fasta,
+        "qual": qual,
+        "fasta_sha256": sha256(fasta),
+        "qual_sha256": sha256(qual),
     }
 
 
-# --------------------------------------------------
-# Reverse-complement 처리
-# --------------------------------------------------
-def make_reverse_complement(sequence, qualities):
-    reverse_complement_sequence = str(
-        Seq(sequence).reverse_complement()
-    )
-
-    # 서열의 방향이 뒤집히므로 Quality 순서도 뒤집음
-    reverse_complement_qualities = qualities[::-1]
-
-    return (
-        reverse_complement_sequence,
-        reverse_complement_qualities,
-    )
-
-
-# --------------------------------------------------
-# Quality 그래프
-# --------------------------------------------------
-def show_quality_chart(read_data, direction):
-    quality_scores = read_data["quality_scores"]
-
-    if not quality_scores:
-        st.warning(
-            f"{direction} 파일에서 Quality 정보를 찾지 못했습니다."
+def prepare_preview(reads, method="mean_q"):
+    packets = {}
+    for condition in CONDITIONS:
+        processed = [preview_trim(read, condition, method) for read in reads]
+        packets[condition.label] = input_packet(
+            condition, tuple(x[0] for x in processed), "preview_assumption",
+            [x[1] for x in processed],
         )
-        return
-
-    chart_data = pd.DataFrame(
-        {
-            "Base position": range(
-                1,
-                len(quality_scores) + 1,
-            ),
-            "Quality": quality_scores,
-        }
-    )
-
-    chart_data = chart_data.set_index("Base position")
-
-    st.subheader(f"{direction} Quality 분포")
-    st.line_chart(chart_data)
-
-# --------------------------------------------------
-# Alignment용 서열 정리
-# --------------------------------------------------
-def normalize_alignment_sequence(sequence):
-    """
-    A, C, G, T 이외의 염기는 N으로 변환합니다.
-    서열 길이와 위치는 유지됩니다.
-    """
-
-    return "".join(
-        base if base in "ACGT" else "N"
-        for base in sequence.upper()
-    )
+    return packets
 
 
-# --------------------------------------------------
-# Quality-weighted terminal overlap 분석
-# --------------------------------------------------
-TERMINAL_SEARCH_BASES = 700
-GAP_QUALITY_WEIGHT = 0.5
-JUNCTION_ANCHOR_BASES = 60
-JUNCTION_SOFTCLIP_ADJACENT_BASES = 60
+def load_input_zip(data: bytes):
+    """ZIP은 디스크에 풀지 않는다. 알려진 네 경로의 입력만 읽는다."""
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ValueError("입력 ZIP이 20 MiB를 초과합니다.")
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        infos = archive.infolist()
+        if len(infos) > 100 or sum(i.file_size for i in infos) > MAX_UPLOAD_BYTES:
+            raise ValueError("ZIP의 파일 수 또는 압축 해제 크기가 허용 범위를 초과합니다.")
+        if any(info.flag_bits & 1 for info in infos):
+            raise ValueError("암호화된 ZIP은 지원하지 않습니다.")
+        names = [i.filename for i in infos]
+        if len(names) != len(set(names)):
+            raise ValueError("ZIP 내부에 중복 파일명이 있습니다.")
+        for name in names:
+            path = PurePosixPath(name)
+            if path.is_absolute() or ".." in path.parts or "\\" in name:
+                raise ValueError("ZIP 내부 경로가 올바르지 않습니다.")
+        manifest = {}
+        if "manifest.json" in names:
+            manifest = json.loads(archive.read("manifest.json"))
+            if not isinstance(manifest, dict):
+                raise ValueError("manifest.json 형식이 올바르지 않습니다.")
+        manifest_conditions = manifest.get("conditions", {})
+        if not isinstance(manifest_conditions, dict):
+            raise ValueError("manifest의 conditions는 조건별 객체여야 합니다.")
+        packets = {}
+        for condition in CONDITIONS:
+            fasta_name = f"{condition.key}/reads.fasta"
+            qual_name = fasta_name + ".qual"
+            if fasta_name not in names and qual_name not in names:
+                continue
+            if fasta_name not in names or qual_name not in names:
+                raise ValueError(f"{condition.label}: FASTA와 QUAL을 함께 넣어 주세요.")
+            fasta, qual = archive.read(fasta_name), archive.read(qual_name)
+            reads = decode_fasta_qual(fasta, qual)
+            entry = manifest_conditions.get(condition.label, {})
+            if not isinstance(entry, dict):
+                raise ValueError(f"{condition.label}: manifest 항목 형식이 올바르지 않습니다.")
+            trim_metadata = entry.get("trim_metadata", [])
+            if not isinstance(trim_metadata, list) or any(not isinstance(item, dict) for item in trim_metadata):
+                raise ValueError(f"{condition.label}: 전처리 좌표 정보가 올바르지 않습니다.")
+            if entry.get("condition") and entry["condition"] != asdict(condition):
+                raise ValueError(f"{condition.label}: manifest의 QT/Window 설정이 현재 조건과 다릅니다.")
+            for key, payload in (("fasta_sha256", fasta), ("qual_sha256", qual)):
+                if entry.get(key) and entry[key] != sha256(payload):
+                    raise ValueError(f"{condition.label}: 입력 파일이 manifest 기록과 다릅니다.")
+            # 이 앱이 만든 시범 입력을 재업로드해도 실제 사내 전처리로 승격하지 않는다.
+            source = (
+                "preview_assumption" if entry.get("input_source") == "preview_assumption"
+                else "provided_unverified"
+            )
+            packets[condition.label] = input_packet(condition, reads, source,
+                trim_metadata, (fasta, qual))
+        if not packets:
+            raise ValueError("16, 20_10, 30_20, 10 폴더의 reads.fasta/reads.fasta.qual을 찾지 못했습니다.")
+        return packets
 
 
-def quality_weight(quality):
-    """Phred quality를 0~1 범위의 경험적 가중치로 변환합니다."""
-
-    bounded_quality = min(max(float(quality), 0.0), 40.0)
-    return bounded_quality / 40.0
+def normalize_sequence(sequence):
+    return "".join(base if base in "ACGT" else "N" for base in sequence.upper())
 
 
-def normalize_quality_scores(sequence, qualities):
-    """Quality 길이를 서열 길이에 맞추고 누락값은 Q0으로 채웁니다."""
-
-    normalized = list(qualities or [])[: len(sequence)]
-
-    if len(normalized) < len(sequence):
-        normalized.extend([0] * (len(sequence) - len(normalized)))
-
-    return normalized
-
-
-def summarize_bilateral_gap_support(
-    indices,
-    left_qualities,
-    right_qualities,
-    left_window_start,
-    qt_threshold,
-):
-    """Gap 염기와 반대 read의 양쪽 인접 염기가 모두 QT 이상인지 평가.
-
-    한 read의 높은 Q만으로 gap을 고품질 충돌로 확정하지 않습니다.
-    Gap 블록을 둘러싼 반대 read의 두 Q 중 작은 값을 상한으로 쓰며,
-    양쪽 flank가 없으면 지지 근거를 0으로 둡니다. 기존 gap 지표는
-    그대로 유지하고, 이 보조 지표만 별도로 반환합니다.
-    """
-    positions = list(zip(indices[0], indices[1]))
-    qualities = (left_qualities[left_window_start:], right_qualities)
-    supported_bases = longest_run = 0
-    column = 0
-    while column < len(positions):
-        left_index, right_index = positions[column]
-        if left_index >= 0 and right_index >= 0:
-            column += 1
-            continue
-        gap_axis = 0 if left_index < 0 else 1
-        base_axis = 1 - gap_axis
-        end = column + 1
-        while end < len(positions) and positions[end][gap_axis] < 0:
-            end += 1
-        flank_qualities = []
-        for start, step in ((column - 1, -1), (end, 1)):
-            position = start
-            while (
-                0 <= position < len(positions)
-                and positions[position][gap_axis] < 0
-            ):
-                position += step
-            if 0 <= position < len(positions):
-                flank_qualities.append(
-                    qualities[gap_axis][int(positions[position][gap_axis])]
-                )
-        opposite_quality = (
-            min(flank_qualities) if len(flank_qualities) == 2 else 0
-        )
-        current_run = 0
-        for position in range(column, end):
-            own_quality = qualities[base_axis][
-                int(positions[position][base_axis])
-            ]
-            if min(own_quality, opposite_quality) >= qt_threshold:
-                supported_bases += 1
-                current_run += 1
-                longest_run = max(longest_run, current_run)
-            else:
-                current_run = 0
-        column = end
-    return supported_bases, longest_run
-
-
-def build_terminal_candidate(
-    left_sequence,
-    left_qualities,
-    right_sequence,
-    right_qualities,
-    left_label,
-    right_label,
-    qt_threshold,
-    new_qt_threshold,
-):
-    """
-    왼쪽 read의 suffix와 오른쪽 read의 prefix만 검색합니다.
-    정렬 밖의 junction 인접 염기는 삭제하지 않고 soft-clip 후보로
-    유지한 뒤 Quality를 이용해 부담을 계산합니다.
-    """
-
-    left_window_start = max(
-        0,
-        len(left_sequence) - TERMINAL_SEARCH_BASES,
-    )
-
-    left_window = left_sequence[left_window_start:]
-    right_window = right_sequence[:TERMINAL_SEARCH_BASES]
-
-    if not left_window or not right_window:
+def inspect_overlap(forward: Read, reverse: Read, qt: int):
+    """전처리 후 두 read의 참고 정렬. phrap의 조립 성공 판정이 아니다."""
+    if not forward.sequence or not reverse.sequence:
         return None
-
-    aligner = PairwiseAligner()
-    aligner.mode = "local"
-    aligner.match_score = 2
-    aligner.mismatch_score = -3
-    aligner.open_gap_score = -5
-    aligner.extend_gap_score = -1
+    aligner = PairwiseAligner(mode="local", match_score=2, mismatch_score=-3,
+                              open_gap_score=-5, extend_gap_score=-1)
     aligner.wildcard = "N"
-
-    alignments = aligner.align(
-        normalize_alignment_sequence(left_window),
-        normalize_alignment_sequence(right_window),
-    )
-
-    try:
-        alignment = alignments[0]
-    except IndexError:
-        return None
-
-    coordinates = alignment.coordinates
-
-    left_start = (
-        left_window_start + int(coordinates[0, 0])
-    )
-    left_end = (
-        left_window_start + int(coordinates[0, -1])
-    )
-    right_start = int(coordinates[1, 0])
-    right_end = int(coordinates[1, -1])
-
-    aligned_left = str(alignment[0])
-    aligned_right = str(alignment[1])
-    indices = alignment.indices
-    bilateral_gap_bases, bilateral_longest_gap_run = (
-        summarize_bilateral_gap_support(
-            indices, left_qualities, right_qualities,
-            left_window_start, qt_threshold,
-        )
-    )
-
-    markers = []
-    matches = 0
-    mismatches = 0
-    gaps = 0
-    ambiguous = 0
-
-    match_weight_total = 0.0
-    mismatch_weight_total = 0.0
-    gap_weight_total = 0.0
-    ambiguous_weight_total = 0.0
-
-    qt_supported_matches = 0
-    qt_supported_mismatches = 0
-    qt_supported_gaps = 0
-    qt_supported_ambiguous = 0
-    qt_supported_longest_match_run = 0
-    qt_supported_current_match_run = 0
-    longest_gap_run = 0
-    current_gap_run = 0
-
-    for left_index, right_index in zip(
-        indices[0],
-        indices[1],
-    ):
-        if left_index < 0 or right_index < 0:
-            gaps += 1
-            current_gap_run += 1
-            longest_gap_run = max(
-                longest_gap_run,
-                current_gap_run,
-            )
-            markers.append(" ")
-            qt_supported_current_match_run = 0
-
-            if left_index >= 0:
-                full_left_index = (
-                    left_window_start + int(left_index)
-                )
-                gap_quality = left_qualities[full_left_index]
-            else:
-                gap_quality = right_qualities[int(right_index)]
-
-            gap_weight_total += (
-                quality_weight(gap_quality)
-                * GAP_QUALITY_WEIGHT
-            )
-
-            if gap_quality >= qt_threshold:
-                qt_supported_gaps += 1
-
-            continue
-
-        current_gap_run = 0
-
-        full_left_index = (
-            left_window_start + int(left_index)
-        )
-        full_right_index = int(right_index)
-
-        left_base = left_sequence[full_left_index]
-        right_base = right_sequence[full_right_index]
-        paired_quality = min(
-            left_qualities[full_left_index],
-            right_qualities[full_right_index],
-        )
-        paired_weight = quality_weight(paired_quality)
-
-        if left_base not in "ACGT" or right_base not in "ACGT":
-            ambiguous += 1
-            ambiguous_weight_total += paired_weight
-            markers.append("?")
-            qt_supported_current_match_run = 0
-
-            if paired_quality >= qt_threshold:
-                qt_supported_ambiguous += 1
-
-        elif left_base == right_base:
-            matches += 1
-            match_weight_total += paired_weight
-            markers.append("|")
-
-            if paired_quality >= qt_threshold:
-                qt_supported_matches += 1
-                qt_supported_current_match_run += 1
-                qt_supported_longest_match_run = max(
-                    qt_supported_longest_match_run,
-                    qt_supported_current_match_run,
-                )
-            else:
-                qt_supported_current_match_run = 0
-
-        else:
-            mismatches += 1
-            mismatch_weight_total += paired_weight
-            markers.append(".")
-            qt_supported_current_match_run = 0
-
-            if paired_quality >= qt_threshold:
-                qt_supported_mismatches += 1
-
-    paired_bases = matches + mismatches + ambiguous
-    alignment_columns = len(aligned_left)
-
-    base_identity = (
-        matches / paired_bases * 100
-        if paired_bases > 0
-        else 0.0
-    )
-    gap_included_identity = (
-        matches / alignment_columns * 100
-        if alignment_columns > 0
-        else 0.0
-    )
-    gap_rate = (
-        gaps / alignment_columns * 100
-        if alignment_columns > 0
-        else 0.0
-    )
-
-    weighted_denominator = (
-        match_weight_total
-        + mismatch_weight_total
-        + gap_weight_total
-        + ambiguous_weight_total
-    )
-
-    quality_weighted_identity = (
-        match_weight_total / weighted_denominator * 100
-        if weighted_denominator > 0
-        else 0.0
-    )
-
-    left_tail_qualities = left_qualities[left_end:]
-    right_head_qualities = right_qualities[:right_start]
-    terminal_qualities = (
-        left_tail_qualities + right_head_qualities
-    )
-    terminal_slack_total = len(terminal_qualities)
-
-    # 전체 soft-clip의 평균만 보면, 실제 overlap 경계 바로 옆에
-    # 고품질 염기가 몰려 있는 구조를 놓칠 수 있습니다. 왼쪽
-    # read는 tail의 시작, 오른쪽 read는 head의 끝이 junction에
-    # 인접하므로 각각 최대 60 bp를 따로 보존합니다.
-    left_softclip_adjacent_qualities = left_tail_qualities[
-        :JUNCTION_SOFTCLIP_ADJACENT_BASES
-    ]
-    right_softclip_adjacent_qualities = right_head_qualities[
-        -JUNCTION_SOFTCLIP_ADJACENT_BASES:
-    ]
-
-    # 정렬 경계 안쪽의 품질을 read별로 따로 평가합니다. 이 값은
-    # contig 성공 여부가 아니라 어느 방향의 재반응이 더 유리한지
-    # 판단하는 보조 근거로 사용합니다.
-    left_anchor_qualities = left_qualities[
-        max(left_start, left_end - JUNCTION_ANCHOR_BASES):left_end
-    ]
-    right_anchor_qualities = right_qualities[
-        right_start:min(
-            right_end,
-            right_start + JUNCTION_ANCHOR_BASES,
-        )
-    ]
-
-    def mean_quality(values):
-        return sum(values) / len(values) if values else 0.0
-
-    def threshold_fraction(values, threshold):
-        if not values:
-            return 0.0
-
-        return sum(value >= threshold for value in values) / len(values)
-
-    new_qt_enabled = new_qt_threshold is not None
-    terminal_quality_threshold = (
-        new_qt_threshold
-        if new_qt_enabled
-        else qt_threshold
-    )
-
-    if terminal_quality_threshold > 0:
-        terminal_high_quality_bases = sum(
-            quality >= terminal_quality_threshold
-            for quality in terminal_qualities
-        )
-        terminal_quality_burden = sum(
-            max(quality - terminal_quality_threshold + 1, 0)
-            / max(41 - terminal_quality_threshold, 1)
-            for quality in terminal_qualities
-        )
-    else:
-        # 품질 경계가 0인 예외 조건은 모든 말단 염기를 유지합니다.
-        terminal_high_quality_bases = terminal_slack_total
-        terminal_quality_burden = float(terminal_slack_total)
-
-    if terminal_quality_threshold > 0:
-        left_terminal_high_quality = sum(
-            quality >= terminal_quality_threshold
-            for quality in left_tail_qualities
-        )
-        right_terminal_high_quality = sum(
-            quality >= terminal_quality_threshold
-            for quality in right_head_qualities
-        )
-    else:
-        left_terminal_high_quality = len(left_tail_qualities)
-        right_terminal_high_quality = len(right_head_qualities)
-
-    left_terminal_low_quality = (
-        len(left_tail_qualities) - left_terminal_high_quality
-    )
-    right_terminal_low_quality = (
-        len(right_head_qualities) - right_terminal_high_quality
-    )
-
-    left_source = "Forward" if left_label == "Forward" else "Reverse"
-    right_source = "Forward" if right_label == "Forward" else "Reverse"
-
-    junction_metrics_by_source = {
-        left_source: {
-            "softclip": len(left_tail_qualities),
-            "high_quality_softclip": left_terminal_high_quality,
-            "low_quality_softclip": left_terminal_low_quality,
-            "softclip_adjacent_mean_quality": mean_quality(
-                left_softclip_adjacent_qualities
-            ),
-            "softclip_adjacent_boundary_fraction": threshold_fraction(
-                left_softclip_adjacent_qualities,
-                terminal_quality_threshold,
-            ),
-            "anchor_mean_quality": mean_quality(left_anchor_qualities),
-            "anchor_qt_fraction": threshold_fraction(
-                left_anchor_qualities,
-                qt_threshold,
-            ),
-        },
-        right_source: {
-            "softclip": len(right_head_qualities),
-            "high_quality_softclip": right_terminal_high_quality,
-            "low_quality_softclip": right_terminal_low_quality,
-            "softclip_adjacent_mean_quality": mean_quality(
-                right_softclip_adjacent_qualities
-            ),
-            "softclip_adjacent_boundary_fraction": threshold_fraction(
-                right_softclip_adjacent_qualities,
-                terminal_quality_threshold,
-            ),
-            "anchor_mean_quality": mean_quality(right_anchor_qualities),
-            "anchor_qt_fraction": threshold_fraction(
-                right_anchor_qualities,
-                qt_threshold,
-            ),
-        },
-    }
-
-    forward_junction = junction_metrics_by_source.get(
-        "Forward",
-        {},
-    )
-    reverse_junction = junction_metrics_by_source.get(
-        "Reverse",
-        {},
-    )
-
-    terminal_low_quality_fraction = (
-        (
-            terminal_slack_total
-            - terminal_high_quality_bases
-        )
-        / terminal_slack_total
-        if terminal_slack_total > 0
-        else 1.0
-    )
-
-    qt_supported_conflicts = (
-        qt_supported_mismatches
-        + qt_supported_gaps
-        + qt_supported_ambiguous
-    )
-
-    if left_label == "Forward":
-        forward_start = left_start
-        forward_end = left_end
-        reverse_start = right_start
-        reverse_end = right_end
-    else:
-        reverse_start = left_start
-        reverse_end = left_end
-        forward_start = right_start
-        forward_end = right_end
-
-    candidate_is_usable = (
-        paired_bases >= 20
-        and quality_weighted_identity >= 80
-        and qt_supported_matches >= 10
-    )
-
-    return {
-        "score": round(float(alignment.score), 2),
-        "paired_bases": paired_bases,
-        "alignment_columns": alignment_columns,
-        "matches": matches,
-        "mismatches": mismatches,
-        "gaps": gaps,
-        "longest_gap_run": longest_gap_run,
-        "ambiguous": ambiguous,
-        "identity": round(base_identity, 2),
-        "base_identity": round(base_identity, 2),
-        "gap_included_identity": round(
-            gap_included_identity,
-            2,
-        ),
-        "quality_weighted_identity": round(
-            quality_weighted_identity,
-            2,
-        ),
-        "gap_rate": round(gap_rate, 2),
-        "qt_supported_matches": qt_supported_matches,
-        "qt_supported_longest_match_run": (
-            qt_supported_longest_match_run
-        ),
-        "qt_supported_mismatches": qt_supported_mismatches,
-        "qt_supported_gaps": qt_supported_gaps,
-        "qt_supported_ambiguous": qt_supported_ambiguous,
-        "qt_supported_conflicts": qt_supported_conflicts,
-        "qt_bilateral_gap_bases": bilateral_gap_bases,
-        "qt_bilateral_longest_gap_run": bilateral_longest_gap_run,
-        "qt_bilateral_conflicts": (
-            bilateral_gap_bases
-            + qt_supported_mismatches
-            + qt_supported_ambiguous
-        ),
-        "forward_start": forward_start,
-        "forward_end": forward_end,
-        "reverse_start": reverse_start,
-        "reverse_end": reverse_end,
-        "forward_head_unaligned": forward_start,
-        "forward_tail_unaligned": (
-            len(right_sequence if right_label == "Forward" else left_sequence)
-            - forward_end
-        ),
-        "reverse_head_unaligned": reverse_start,
-        "reverse_tail_unaligned": (
-            len(right_sequence if right_label == "Reverse-complement" else left_sequence)
-            - reverse_end
-        ),
-        "connection_direction": (
-            f"{left_label} → {right_label}"
-        ),
-        "left_sequence": left_label,
-        "right_sequence": right_label,
-        "left_tail_unaligned": len(left_tail_qualities),
-        "right_head_unaligned": len(right_head_qualities),
-        "terminal_slack_total": terminal_slack_total,
-        "terminal_high_quality_bases": (
-            terminal_high_quality_bases
-        ),
-        "terminal_quality_burden": round(
-            terminal_quality_burden,
-            2,
-        ),
-        "terminal_low_quality_fraction": round(
-            terminal_low_quality_fraction,
-            4,
-        ),
-        "new_qt_enabled": new_qt_enabled,
-        "terminal_quality_threshold": terminal_quality_threshold,
-        "forward_junction_softclip": forward_junction.get(
-            "softclip",
-            0,
-        ),
-        "reverse_junction_softclip": reverse_junction.get(
-            "softclip",
-            0,
-        ),
-        "forward_junction_high_quality_softclip": (
-            forward_junction.get("high_quality_softclip", 0)
-        ),
-        "reverse_junction_high_quality_softclip": (
-            reverse_junction.get("high_quality_softclip", 0)
-        ),
-        "forward_junction_low_quality_softclip": (
-            forward_junction.get("low_quality_softclip", 0)
-        ),
-        "reverse_junction_low_quality_softclip": (
-            reverse_junction.get("low_quality_softclip", 0)
-        ),
-        "forward_junction_softclip_adjacent_mean_quality": round(
-            forward_junction.get(
-                "softclip_adjacent_mean_quality",
-                0.0,
-            ),
-            2,
-        ),
-        "reverse_junction_softclip_adjacent_mean_quality": round(
-            reverse_junction.get(
-                "softclip_adjacent_mean_quality",
-                0.0,
-            ),
-            2,
-        ),
-        "forward_junction_softclip_adjacent_boundary_fraction": round(
-            forward_junction.get(
-                "softclip_adjacent_boundary_fraction",
-                0.0,
-            ),
-            4,
-        ),
-        "reverse_junction_softclip_adjacent_boundary_fraction": round(
-            reverse_junction.get(
-                "softclip_adjacent_boundary_fraction",
-                0.0,
-            ),
-            4,
-        ),
-        "forward_junction_anchor_mean_quality": round(
-            forward_junction.get("anchor_mean_quality", 0.0),
-            2,
-        ),
-        "reverse_junction_anchor_mean_quality": round(
-            reverse_junction.get("anchor_mean_quality", 0.0),
-            2,
-        ),
-        "forward_junction_anchor_qt_fraction": round(
-            forward_junction.get("anchor_qt_fraction", 0.0),
-            4,
-        ),
-        "reverse_junction_anchor_qt_fraction": round(
-            reverse_junction.get("anchor_qt_fraction", 0.0),
-            4,
-        ),
-        "candidate_is_usable": candidate_is_usable,
-        "aligned_left": aligned_left,
-        "aligned_right": aligned_right,
-        "aligned_forward": aligned_left,
-        "aligned_reverse": aligned_right,
-        "markers": "".join(markers),
-    }
-
-
-def analyze_overlap(
-    forward_sequence,
-    forward_qualities,
-    reverse_complement_sequence,
-    reverse_complement_qualities,
-    qt_threshold=30,
-    new_qt_threshold=20,
-    reverse_label="Reverse-complement",
-):
-    """
-    원본 read를 hard trimming하지 않고 두 연결 방향의 terminal
-    overlap을 각각 평가한 뒤 Quality 부담이 낮은 후보를 선택합니다.
-    """
-
-    if not forward_sequence or not reverse_complement_sequence:
-        return None
-
-    forward_sequence = normalize_alignment_sequence(
-        forward_sequence
-    )
-    reverse_complement_sequence = normalize_alignment_sequence(
-        reverse_complement_sequence
-    )
-
-    forward_qualities = normalize_quality_scores(
-        forward_sequence,
-        forward_qualities,
-    )
-    reverse_complement_qualities = normalize_quality_scores(
-        reverse_complement_sequence,
-        reverse_complement_qualities,
-    )
-
-    candidates = [
-        build_terminal_candidate(
-            forward_sequence,
-            forward_qualities,
-            reverse_complement_sequence,
-            reverse_complement_qualities,
-            "Forward",
-            reverse_label,
-            qt_threshold,
-            new_qt_threshold,
-        ),
-        build_terminal_candidate(
-            reverse_complement_sequence,
-            reverse_complement_qualities,
-            forward_sequence,
-            forward_qualities,
-            reverse_label,
-            "Forward",
-            qt_threshold,
-            new_qt_threshold,
-        ),
-    ]
-
-    candidates = [
-        candidate
-        for candidate in candidates
-        if candidate is not None
-    ]
-
-    if not candidates:
-        return None
-
-    return min(
-        candidates,
-        key=lambda candidate: (
-            0 if candidate["candidate_is_usable"] else 1,
-            candidate["terminal_high_quality_bases"],
-            candidate["terminal_quality_burden"],
-            -candidate["quality_weighted_identity"],
-            -candidate["qt_supported_matches"],
-            -candidate["paired_bases"],
-        ),
-    )
-
-
-def analyze_best_reverse_orientation(
-    forward_sequence,
-    forward_qualities,
-    reverse_sequence,
-    reverse_qualities,
-    qt_threshold=30,
-    new_qt_threshold=20,
-):
-    """
-    Reverse 파일의 원본 방향과 reverse-complement 방향을 모두
-    분석합니다. 파일명이나 primer 표기 대신 실제 서열 정렬
-    근거가 더 좋은 방향을 자동 선택합니다.
-    """
-
-    reverse_complement, reverse_complement_qualities = (
-        make_reverse_complement(
-            reverse_sequence,
-            reverse_qualities,
-        )
-    )
-
-    raw_candidate = analyze_overlap(
-        forward_sequence,
-        forward_qualities,
-        reverse_sequence,
-        reverse_qualities,
-        qt_threshold,
-        new_qt_threshold,
-        reverse_label="Reverse read (원본)",
-    )
-
-    reverse_complement_candidate = analyze_overlap(
-        forward_sequence,
-        forward_qualities,
-        reverse_complement,
-        reverse_complement_qualities,
-        qt_threshold,
-        new_qt_threshold,
-        reverse_label="Reverse-complement",
-    )
-
+    fseq = normalize_sequence(forward.sequence)
     candidates = []
-
-    if raw_candidate is not None:
-        raw_candidate["reverse_orientation"] = (
-            "원본 Reverse 방향 사용"
+    for complemented in (True, False):
+        rseq = normalize_sequence(
+            str(Seq(reverse.sequence).reverse_complement()) if complemented else reverse.sequence
         )
-        candidates.append(raw_candidate)
-
-    if reverse_complement_candidate is not None:
-        reverse_complement_candidate["reverse_orientation"] = (
-            "Reverse-complement 적용"
-        )
-        candidates.append(reverse_complement_candidate)
-
+        rq = reverse.qualities[::-1] if complemented else reverse.qualities
+        alignments = aligner.align(fseq, rseq)
+        try:
+            alignment = alignments[0]
+        except IndexError:
+            continue
+        matches = mismatches = gaps = ambiguous = qt_matches = qt_conflicts = 0
+        longest_gap = gap_run = 0
+        markers = []
+        for i, j in zip(*alignment.indices):
+            if i < 0 or j < 0:
+                gaps += 1
+                gap_run += 1
+                longest_gap = max(longest_gap, gap_run)
+                q = forward.qualities[i] if i >= 0 else rq[j]
+                qt_conflicts += q >= qt
+                markers.append(" ")
+                continue
+            gap_run = 0
+            q = min(forward.qualities[i], rq[j])
+            if fseq[i] not in "ACGT" or rseq[j] not in "ACGT":
+                ambiguous += 1
+                qt_conflicts += q >= qt
+                markers.append("?")
+            elif fseq[i] == rseq[j]:
+                matches += 1
+                qt_matches += q >= qt
+                markers.append("|")
+            else:
+                mismatches += 1
+                qt_conflicts += q >= qt
+                markers.append(".")
+        paired = matches + mismatches + ambiguous
+        coordinates = alignment.coordinates
+        fs, fe, rs, re_ = (int(coordinates[0, 0]), int(coordinates[0, -1]),
+                            int(coordinates[1, 0]), int(coordinates[1, -1]))
+        junction_fr = len(fseq) - fe + rs
+        junction_rf = len(rseq) - re_ + fs
+        candidates.append({
+            "score": float(alignment.score), "paired_bases": paired,
+            "base_identity": round(100 * matches / paired, 2) if paired else 0,
+            "gap_identity": round(100 * matches / (paired + gaps), 2) if paired + gaps else 0,
+            "matches": matches, "mismatches": mismatches, "gaps": gaps,
+            "ambiguous": ambiguous, "longest_gap": longest_gap,
+            "qt_matches": int(qt_matches), "qt_conflicts": int(qt_conflicts),
+            "junction_unaligned": min(junction_fr, junction_rf),
+            "connection": "F → R" if junction_fr <= junction_rf else "R → F",
+            "reverse_orientation": "Reverse complement" if complemented else "원본 방향",
+            "forward_start": fs, "forward_end": fe, "reverse_start": rs, "reverse_end": re_,
+            "aligned_f": str(alignment[0]), "aligned_r": str(alignment[1]),
+            "markers": "".join(markers),
+        })
     if not candidates:
         return None
-
-    best_candidate = min(
-        candidates,
-        key=lambda candidate: (
-            0 if candidate["candidate_is_usable"] else 1,
-            candidate["terminal_high_quality_bases"],
-            candidate["terminal_quality_burden"],
-            candidate["terminal_slack_total"],
-            -candidate["base_identity"],
-            -candidate["quality_weighted_identity"],
-            -candidate["paired_bases"],
-        ),
-    )
-
-    def read_level_metrics(sequence, qualities):
-        normalized_qualities = normalize_quality_scores(
-            sequence,
-            qualities,
-        )
-        read_length = len(sequence)
-
-        if read_length:
-            mean_quality = sum(normalized_qualities) / read_length
-            q20_fraction = sum(
-                quality >= 20
-                for quality in normalized_qualities
-            ) / read_length
-            q30_fraction = sum(
-                quality >= 30
-                for quality in normalized_qualities
-            ) / read_length
-        else:
-            mean_quality = 0.0
-            q20_fraction = 0.0
-            q30_fraction = 0.0
-
-        qt_readthrough = estimate_quality_readthrough(
-            normalized_qualities,
-            threshold=qt_threshold,
-        )
-
-        return {
-            "read_length": read_length,
-            "mean_quality": round(mean_quality, 2),
-            "q20_fraction": round(q20_fraction, 4),
-            "q30_fraction": round(q30_fraction, 4),
-            "qt_readthrough": qt_readthrough,
-        }
-
-    forward_metrics = read_level_metrics(
-        forward_sequence,
-        forward_qualities,
-    )
-    reverse_metrics = read_level_metrics(
-        reverse_sequence,
-        reverse_qualities,
-    )
-
-    for key, value in forward_metrics.items():
-        best_candidate[f"forward_{key}"] = value
-
-    for key, value in reverse_metrics.items():
-        best_candidate[f"reverse_{key}"] = value
-
-    return best_candidate
-
-
-# --------------------------------------------------
-# 회사 프로그램 조건 프리셋
-# --------------------------------------------------
-COMPANY_CONDITIONS = [
-    "16",
-    "20",
-    "20/10",
-    "20/20",
-    "25/21",
-    "30/10",
-    "30/20",
-    "30/40",
-    "10",
-]
-
-CONDITION_THRESHOLDS = {
-    # None은 New QT 체크 해제(미사용)를 의미합니다.
-    "16": (16, None),
-    "10": (10, None),
-    "20": (20, None),
-    "20/10": (20, 10),
-    "20/20": (20, 20),
-    "25/21": (25, 21),
-    "30/10": (30, 10),
-    "30/20": (30, 20),
-    "30/40": (30, 40),
-}
-
-# 30/20에서 저품질 말단이 제거 가능하더라도, 짧은 overlap만으로
-# F/R 결합 성공을 과대 판정하지 않도록 하는 경험적 하한입니다.
-# 현재 성공 사례(KHS2: 75 bp)와 Contig2 사례
-# (WT: 60 bp, KNIBR033: 69 bp, B-OT-119: 74 bp)를 기준으로
-# 보정했습니다. 따라서 30/20 직접 결합은 75 bp부터 인정합니다.
-MIN_DIRECT_30_20_OVERLAP = 75
-MIN_CONTIG2_OVERLAP = 40
-
-# KCKM1002-4 NS1/NS24처럼 overlap 전체는 길고 junction은 깨끗하지만,
-# overlap 내부에 gap이 분산되어 Q30 연속 match와 conflict 비율이
-# 일반 직접 결합 기준을 통과하지 못하는 실제 30/20 성공 유형입니다.
-# QT16의 보수 기준은 그대로 유지하고 30/20에서만 별도로 평가합니다.
-MIN_LONG_GAPPED_30_20_OVERLAP = 250
-MIN_LONG_GAPPED_30_20_GAP_IDENTITY = 85
-MAX_LONG_GAPPED_30_20_TERMINAL_SLACK = 50
-MAX_LONG_GAPPED_30_20_GAP_RUN = 2
-
-# 2026-09-23 NS1/NS24 4쌍의 실측 보정. 원본 gap 길이와 함께
-# 반대 read의 양쪽 flank까지 QT 이상인 gap의 연속성을 평가합니다.
-# 이는 경험적 예측 경계이며 실제 회사 프로그램의 QT trimming을
-# 재현하거나 독립 검증된 정확도를 의미하지 않습니다.
-# 실측 해석: I-260877/260895/260899/260901 모두 QT16·QT10 Contig2;
-# 20/10은 260877·260899 성공, 30/20은 260895만 Contig2.
-# 사용자 표기 20877/20899/26085는 위 첨부 파일명으로 해석했습니다.
-MIN_BILATERAL_RESCUE_OVERLAP = 250
-MIN_BILATERAL_RESCUE_WEIGHTED_IDENTITY = 92
-MAX_BILATERAL_RESCUE_GAP_RUN = 1
-MAX_BILATERAL_RESCUE_CONFLICT_FRACTION = 0.10
-MAX_QT10_LONG_ANCHOR_GAP_RUN = 3
-
-# 긴 내부 overlap 양쪽의 read-through가 대부분 New QT 미만이면
-# 제거 가능한 말단으로 볼 수 있습니다. TTO 변형 사례처럼 저품질
-# 비율이 78~80% 경계이면 gap 포함 Identity까지 함께 확인합니다.
-# 이 복합 경계로 TTO 30/20 Contig2와 25/21 성공을 구분하면서,
-# A-B21 30/20 성공 패턴을 유지합니다. 고QT 내부 overlap 성공은
-# 실제 성공군과 신규 Contig2군을 구분하기 위해 300 bp 이상을
-# 추가로 요구합니다.
-MIN_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION = 0.80
-MIN_MARGINAL_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION = 0.78
-MIN_MARGINAL_HIGH_QT_INTERNAL_GAP_IDENTITY = 96
-MIN_HIGH_QT_INTERNAL_SUCCESS_OVERLAP = 300
-MAX_HIGH_QT_INTERNAL_ADJACENT_SOFTCLIP_MEAN = 24
-
-# WT-M13 20/10 실제 결과를 구분하는 장거리 내부 overlap 경계입니다.
-# 성공 사례는 overlap 295 bp / read-through 797 bp / Q20 연속 43 bp,
-# Contig2 사례는 각각 270 bp / 855 bp / 74 bp,
-# 294 bp / 805 bp / 36 bp, 317 bp / 760 bp / 40 bp였습니다.
-# 따라서 연속 match 하나가 아닌 overlap 길이와 양쪽 read-through
-# 부담까지 함께 평가하며, Q20 연속 성공 경계는 43 bp입니다.
-MIN_LOW_QT_INTERNAL_SUCCESS_OVERLAP = 280
-MAX_LOW_QT_INTERNAL_SUCCESS_TERMINAL_SLACK = 800
-MIN_LOW_QT_INTERNAL_SUCCESS_LONGEST_RUN = 43
-MIN_LOW_QT_INTERNAL_CONTIG2_LONGEST_RUN = 30
-
-# New QT를 사용하지 않는 QT16 조건은 낮은 품질 말단을 별도로
-# 확장/제외하는 보조 단계가 없습니다. B-OT-119(74 bp),
-# MMC-260904-02(68 bp), MPHKG-1(69 bp)이 모두 실제 Contig2였으므로
-# 일반적인 75 bp 미만 overlap의 성공 승격은 막습니다. 다만 전체
-# read 길이와 Quality가 실제 성공군의 사전 정리형 구조까지 충족하면
-# 아래의 별도 read-level 예외로 평가합니다. 75 bp 이상도 gap 포함
-# Identity 하한을 적용하며, MMC-260819-01처럼 2 bp 연속 gap이
-# 확인된 경우는 Contig2로 유지합니다.
-MIN_DIRECT_QT16_OVERLAP = 75
-MIN_QT16_GAP_INCLUDED_IDENTITY = 90
-MAX_QT16_GAP_RUN = 1
-
-# MPHKG-1은 QT16에서 Contig2였지만 단독 QT20에서 실제 결합됐습니다.
-# QT20이 낮은 품질의 짧은 말단을 제외해 주는 패턴을 primer명이 아닌
-# 정렬 구조로 재현합니다. 짧은 overlap의 과대 판정을 막기 위해
-# overlap, Identity, gap, 연속 Quality anchor, 말단 제거 부담을 모두
-# 동시에 만족할 때만 이 QT20 전용 성공 경로를 허용합니다.
-MIN_QT20_TRIMMED_OVERLAP = 60
-MIN_QT20_TRIMMED_BASE_IDENTITY = 98
-MIN_QT20_TRIMMED_GAP_IDENTITY = 94
-MIN_QT20_TRIMMED_WEIGHTED_IDENTITY = 96
-MIN_QT20_TRIMMED_MATCHES = 45
-MIN_QT20_TRIMMED_LONGEST_RUN = 15
-MAX_QT20_TRIMMED_CONFLICTS = 3
-MAX_QT20_TRIMMED_GAPS = 3
-MAX_QT20_TRIMMED_GAP_RUN = 1
-MAX_QT20_TRIMMED_TERMINAL_SLACK = 25
-MIN_QT20_TRIMMED_LOW_QUALITY_FRACTION = 0.95
-MAX_QT20_TRIMMED_ADJACENT_SOFTCLIP_MEAN = 5.5
-
-# CW1IE-5의 두 785F 반응은 같은 907R과 65 bp overlap을 만들지만,
-# 원본 read 길이와 전체 Quality 구조에 따라 실제 결과가 달랐습니다.
-# 한쪽 read가 이미 짧고 매우 깨끗하며 다른 쪽은 긴 구조인 경우에는
-# 낮은 QT에서도 안정적으로 결합됐습니다. 반대로 양쪽에 긴 저품질
-# tail이 남은 구조는 QT30/New QT20에서만 결합됐습니다. 파일명이나
-# primer명이 아니라 raw read 길이, 전체 Quality, QT read-through와
-# junction 지표를 함께 사용해 두 유형을 구분합니다.
-MIN_SHORT_TERMINAL_OVERLAP = 60
-MAX_SHORT_TERMINAL_OVERLAP = 74
-MIN_PRETRIMMED_BASE_IDENTITY = 96
-MIN_PRETRIMMED_GAP_IDENTITY = 90
-MIN_PRETRIMMED_WEIGHTED_IDENTITY = 93
-MIN_PRETRIMMED_QT_MATCHES = 30
-MIN_PRETRIMMED_LONGEST_RUN = 9
-MAX_PRETRIMMED_CONFLICTS = 5
-MAX_PRETRIMMED_GAPS = 5
-MAX_PRETRIMMED_GAP_RUN = 1
-MAX_PRETRIMMED_TERMINAL_SLACK = 20
-MAX_PRETRIMMED_TERMINAL_HIGH_QUALITY = 1
-MIN_PRETRIMMED_READ_LENGTH_ASYMMETRY = 300
-MAX_PRETRIMMED_SHORT_READ_LENGTH = 1150
-MIN_PRETRIMMED_LONG_READ_LENGTH = 1300
-MIN_PRETRIMMED_SHORT_READ_MEAN_QUALITY = 40
-MIN_PRETRIMMED_LONG_READ_MEAN_QUALITY = 35
-MIN_PRETRIMMED_Q30_FRACTION = 0.50
-MIN_PRETRIMMED_QT_READTHROUGH = 650
-
-MIN_DUAL_LONG_QT30_READ_LENGTH = 1300
-MIN_DUAL_LONG_QT30_READTHROUGH = 650
-MIN_DUAL_LONG_QT30_BASE_IDENTITY = 98
-MIN_DUAL_LONG_QT30_GAP_IDENTITY = 91
-MIN_DUAL_LONG_QT30_WEIGHTED_IDENTITY = 94
-MIN_DUAL_LONG_QT30_MATCHES = 30
-MIN_DUAL_LONG_QT30_LONGEST_RUN = 8
-MAX_DUAL_LONG_QT30_CONFLICTS = 5
-MAX_DUAL_LONG_QT30_GAPS = 5
-MAX_DUAL_LONG_QT30_GAP_RUN = 1
-MAX_DUAL_LONG_QT30_TERMINAL_SLACK = 20
-
-# 현재까지 확인된 AB1 쌍의 실제 결과로 보정한 조건별
-# 출력 유형입니다.
-# 20계열은 terminal overlap이 좋아 보여도 성공으로 자동 승격하지
-# 않고 F/R 개별 출력(Contig2)을 우선합니다. 단독 QT20의 확인된
-# 저품질 말단 제거형은 아래의 엄격한 구조 기준으로만 예외 처리합니다.
-CONTIG2_CALIBRATED_CONDITIONS = {
-    "10",
-    "20",
-    "20/10",
-    "20/20",
-}
-
-NO_CONTIG_CALIBRATED_CONDITIONS = {
-    "30/10",
-    "30/40",
-}
-
-STANDARD_CONDITION_BY_VALUES = {
-    thresholds: label
-    for label, thresholds in CONDITION_THRESHOLDS.items()
-}
-
-
-def parse_company_condition(condition_label):
-    if condition_label not in CONDITION_THRESHOLDS:
-        raise ValueError(
-            f"지원하지 않는 조건입니다: {condition_label}"
-        )
-
-    return CONDITION_THRESHOLDS[condition_label]
-
-
-def format_condition_label(qt_value, new_qt_value):
-    """내부 New QT 미사용값(None)은 화면에서 QT만 표시합니다."""
-
-    if new_qt_value is None:
-        return str(qt_value)
-
-    return f"{qt_value}/{new_qt_value}"
-
-
-def standard_condition_label(qt_value, new_qt_value):
-    """현재 실제 결과로 보정된 표준 조건명을 반환합니다."""
-
-    return STANDARD_CONDITION_BY_VALUES.get(
-        (qt_value, new_qt_value)
-    )
-
-
-def has_strong_deep_internal_structure(overlap_result):
-    """긴 양쪽 overhang 사이에 신뢰 가능한 내부 overlap이 있는지 확인합니다."""
-
-    if overlap_result is None:
-        return False
-
-    qt_matches = overlap_result["qt_supported_matches"]
-    qt_conflicts = overlap_result["qt_supported_conflicts"]
-    forward_softclip = overlap_result[
-        "forward_junction_softclip"
-    ]
-    reverse_softclip = overlap_result[
-        "reverse_junction_softclip"
-    ]
-
-    return (
-        overlap_result["paired_bases"] >= 250
-        and overlap_result["base_identity"] >= 98
-        and overlap_result["gap_included_identity"] >= 94
-        and overlap_result["quality_weighted_identity"] >= 96
-        and overlap_result["gap_rate"] <= 5
-        and qt_matches >= 180
-        and qt_conflicts <= max(15, int(qt_matches * 0.08))
-        and 200 <= forward_softclip <= 500
-        and 200 <= reverse_softclip <= 500
-        and overlap_result["terminal_slack_total"] <= 900
-        and overlap_result.get("reverse_orientation")
-        == "Reverse-complement 적용"
-    )
-
-
-def has_clippable_high_qt_internal_terminal(overlap_result):
-    """고QT 내부 overlap의 양쪽 read-through가 제거 가능한지 평가합니다."""
-
-    low_quality_fraction = overlap_result[
-        "terminal_low_quality_fraction"
-    ]
-    maximum_adjacent_softclip_mean = max(
-        overlap_result.get(
-            "forward_junction_softclip_adjacent_mean_quality",
-            0.0,
-        ),
-        overlap_result.get(
-            "reverse_junction_softclip_adjacent_mean_quality",
-            0.0,
-        ),
-    )
-
-    # MLT 26/24 Contig2 사례는 전체 soft-clip의 86.7%가 Q24
-    # 미만이었지만, overlap 직후 Forward 60 bp 평균이 Q26.83으로
-    # 높았습니다. A-B21/TTO 성공 사례(Q22.92/Q22.55 이하)와 달리
-    # 경계 바로 옆의 신뢰 염기를 잘라야 하므로 제거 가능 말단으로
-    # 승격하지 않습니다. 파일명/primer명은 판정에 사용하지 않습니다.
-    if (
-        maximum_adjacent_softclip_mean
-        > MAX_HIGH_QT_INTERNAL_ADJACENT_SOFTCLIP_MEAN
-    ):
-        return False
-
-    if (
-        low_quality_fraction
-        >= MIN_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION
-    ):
-        return True
-
-    return (
-        low_quality_fraction
-        >= MIN_MARGINAL_HIGH_QT_INTERNAL_LOW_QUALITY_FRACTION
-        and overlap_result["gap_included_identity"]
-        >= MIN_MARGINAL_HIGH_QT_INTERNAL_GAP_IDENTITY
-    )
-
-
-def deep_internal_overlap_mode(
-    overlap_result,
-    qt_threshold,
-    new_qt_threshold,
-):
-    """
-    두 read 말단에 긴 read-through가 남아 있지만 내부에 매우 강한
-    overlap이 있는 유형을 판별합니다. Primer명이 아니라 정렬 구조와
-    junction anchor 품질만 사용합니다.
-    """
-
-    if overlap_result is None or new_qt_threshold is None:
-        return None
-
-    longest_run = overlap_result[
-        "qt_supported_longest_match_run"
-    ]
-    minimum_anchor_quality = min(
-        overlap_result["forward_junction_anchor_mean_quality"],
-        overlap_result["reverse_junction_anchor_mean_quality"],
-    )
-
-    if not has_strong_deep_internal_structure(overlap_result):
-        return None
-
-    # WT-M13처럼 junction anchor가 매우 깨끗하면 QT20/New QT10의
-    # 긴 연속 match로 내부 overlap을 사용할 수 있습니다.
-    if (
-        20 <= qt_threshold < 25
-        and 10 <= new_qt_threshold <= 12
-        and minimum_anchor_quality >= 38
-        and overlap_result["paired_bases"]
-        >= MIN_LOW_QT_INTERNAL_SUCCESS_OVERLAP
-        and overlap_result["terminal_slack_total"]
-        <= MAX_LOW_QT_INTERNAL_SUCCESS_TERMINAL_SLACK
-        and longest_run
-        >= MIN_LOW_QT_INTERNAL_SUCCESS_LONGEST_RUN
-    ):
-        return "고품질 장거리 내부 overlap"
-
-    # A-B21-M13처럼 anchor 품질이 상대적으로 낮으면 QT를 높여
-    # 노이즈를 억제한 조건에서 충분한 연속 match가 남아야 합니다.
-    if (
-        25 <= qt_threshold <= 30
-        and 15 <= new_qt_threshold <= 25
-        and minimum_anchor_quality >= 30
-        and longest_run >= 20
-        and overlap_result["paired_bases"]
-        >= MIN_HIGH_QT_INTERNAL_SUCCESS_OVERLAP
-        and has_clippable_high_qt_internal_terminal(overlap_result)
-    ):
-        return "고QT 장거리 내부 overlap"
-
-    return None
-
-
-def deep_internal_contig2_candidate(
-    overlap_result,
-    qt_threshold,
-    new_qt_threshold,
-):
-    """20/10 부근에서 내부 overlap은 강하지만 anchor가 경계인 유형입니다."""
-
-    if overlap_result is None or new_qt_threshold is None:
-        return False
-
-    longest_run = overlap_result[
-        "qt_supported_longest_match_run"
-    ]
-    minimum_anchor_quality = min(
-        overlap_result["forward_junction_anchor_mean_quality"],
-        overlap_result["reverse_junction_anchor_mean_quality"],
-    )
-
-    low_qt_anchor_boundary = (
-        has_strong_deep_internal_structure(overlap_result)
-        and 20 <= qt_threshold < 25
-        and 10 <= new_qt_threshold <= 12
-        and minimum_anchor_quality >= 38
-        and longest_run
-        >= MIN_LOW_QT_INTERNAL_CONTIG2_LONGEST_RUN
-        and (
-            longest_run
-            < MIN_LOW_QT_INTERNAL_SUCCESS_LONGEST_RUN
-            or overlap_result["paired_bases"]
-            < MIN_LOW_QT_INTERNAL_SUCCESS_OVERLAP
-            or overlap_result["terminal_slack_total"]
-            > MAX_LOW_QT_INTERNAL_SUCCESS_TERMINAL_SLACK
-        )
-    )
-
-    # 내부 overlap 자체는 강하지만 양쪽 read-through에 New QT 이상
-    # 염기가 충분히 남는 경우입니다. 실제 TTO M13 30/20 결과처럼
-    # 하나의 consensus로 승격되지 않고 두 contig로 유지될 수 있습니다.
-    high_qt_internal_boundary = (
-        has_strong_deep_internal_structure(overlap_result)
-        and 25 <= qt_threshold <= 30
-        and 15 <= new_qt_threshold <= 25
-        and minimum_anchor_quality >= 30
-        and longest_run >= 20
-        and (
-            overlap_result["paired_bases"]
-            < MIN_HIGH_QT_INTERNAL_SUCCESS_OVERLAP
-            or not has_clippable_high_qt_internal_terminal(
-                overlap_result
-            )
-        )
-    )
-
-    return low_qt_anchor_boundary or high_qt_internal_boundary
-
-
-def has_long_gapped_terminal_evidence(overlap_result):
-    """충분히 긴 terminal overlap에 gap이 많은 구조로 범위를 제한합니다.
-
-    짧은 overlap 및 M13 장거리 내부 overlap의 기존 보정을 분리합니다.
-    """
-    if not overlap_result:
-        return False
-    return (
-        overlap_result.get("reverse_orientation") == "Reverse-complement 적용"
-        and overlap_result["paired_bases"] >= MIN_BILATERAL_RESCUE_OVERLAP
-        and overlap_result["base_identity"] >= 97
-        and overlap_result["gap_included_identity"] >= 80
-        and overlap_result["quality_weighted_identity"] >= 90
-        and 8 <= overlap_result["gap_rate"] <= 20
-        and overlap_result["terminal_slack_total"] <= 60
-    )
-
-
-def bilateral_terminal_rescue_mode(overlap_result, qt_threshold, new_qt_threshold):
-    """양쪽 품질이 지지하는 gap과 QT 연속 anchor를 함께 평가합니다."""
-    if (
-        new_qt_threshold is None
-        or not has_long_gapped_terminal_evidence(overlap_result)
-        or "qt_bilateral_longest_gap_run" not in overlap_result
-    ):
-        return None
-    matches = overlap_result["qt_supported_matches"]
-    conflicts = overlap_result["qt_bilateral_conflicts"]
-    longest_match = overlap_result["qt_supported_longest_match_run"]
-    if (
-        overlap_result["quality_weighted_identity"]
-        < MIN_BILATERAL_RESCUE_WEIGHTED_IDENTITY
-        or overlap_result["qt_bilateral_longest_gap_run"]
-        > MAX_BILATERAL_RESCUE_GAP_RUN
-        or conflicts > matches * MAX_BILATERAL_RESCUE_CONFLICT_FRACTION
-    ):
-        return None
-    if (
-        20 <= qt_threshold < 25
-        and 10 <= new_qt_threshold <= 12
-        and matches >= 100
-        and longest_match >= 10
-        and overlap_result["terminal_high_quality_bases"] <= 40
-    ):
-        return "양측 품질을 반영한 긴 terminal overlap"
-    terminal_pass = (
-        overlap_result["terminal_high_quality_bases"] <= 30
-        and (
-            overlap_result["terminal_slack_total"] <= 20
-            or overlap_result["terminal_low_quality_fraction"] >= 0.65
-        )
-    )
-    # Q30 연속 anchor가 6~7 bp뿐이면 junction 잔여가 10 bp 이하인
-    # 경우에 한해 새 보정을 허용합니다. C_NS의 31 bp 잔여/7 bp
-    # anchor 구조를 성공으로 승격하지 않습니다.
-    anchor_pass = (
-        longest_match >= 8
-        or (longest_match >= 6 and overlap_result["terminal_slack_total"] <= 10)
-    )
-    if (
-        25 <= qt_threshold <= 30
-        and 15 <= new_qt_threshold <= 25
-        and matches >= 80
-        and anchor_pass
-        and terminal_pass
-    ):
-        return "고QT 양측 품질·junction 보정"
-    return None
-
-
-def bilateral_rescue_prediction(overlap_result, mode, qt_threshold):
-    return {
-        "status": "F+R 결합 성공 예상",
-        "rank": 2,
-        "reason": (
-            f"{mode}; overlap {overlap_result['paired_bases']} bp, "
-            f"원본 최장 gap {overlap_result['longest_gap_run']} bp, "
-            f"양측 Q{qt_threshold} 지지 최장 gap "
-            f"{overlap_result['qt_bilateral_longest_gap_run']} bp, "
-            f"양측 품질 지지 충돌 {overlap_result['qt_bilateral_conflicts']}개"
-        ),
+    # 길이 20 bp/80%는 짧은 우연 일치를 구분하는 참고 표시에만 사용한다.
+    return max(candidates, key=lambda x: (
+        x["paired_bases"] >= 20 and x["base_identity"] >= 80,
+        x["score"], x["paired_bases"], -x["junction_unaligned"],
+    ))
+
+
+def overlap_label(overlap):
+    if overlap is None:
+        return "정렬 후보 없음"
+    if overlap["paired_bases"] < 20 or overlap["base_identity"] < 80:
+        return "짧거나 약한 국소 일치"
+    return "겹침 후보 있음"
+
+
+def split_phrap_options(text):
+    """쉘을 사용하지 않으며 옵션명/숫자 값만 허용한다."""
+    args = shlex.split(text)
+    result = []
+    for arg in args:
+        if arg == "-new_ace":
+            continue
+        if arg in {"-old_ace", "-ace"}:
+            raise ValueError("출력 판독에는 -new_ace를 사용합니다. 다른 ACE 옵션은 제거해 주세요.")
+        if re.fullmatch(r"-[A-Za-z][A-Za-z0-9_]*", arg):
+            result.append(arg)
+            continue
+        try:
+            numeric = float(arg)
+        except ValueError as exc:
+            raise ValueError("추가 옵션에는 옵션명과 숫자만 넣어 주세요. 파일 경로는 지원하지 않습니다.") from exc
+        if not math.isfinite(numeric):
+            raise ValueError("옵션의 숫자는 유한한 값이어야 합니다.")
+        result.append(arg)
+    return result
+
+
+def resolve_phrap(executable):
+    candidate = shutil.which(executable)
+    if candidate:
+        return str(Path(candidate).resolve())
+    path = Path(executable).expanduser()
+    if path.is_file() and (os.name == "nt" or os.access(path, os.X_OK)):
+        return str(path.resolve())
+    raise FileNotFoundError("phrap 실행 파일을 찾지 못했습니다. 실행 환경의 경로를 확인해 주세요.")
+
+
+def read_fasta_ids(text):
+    return {record.id for record in SeqIO.parse(io.StringIO(text), "fasta")}
+
+
+def parse_phrap_outputs(files, read_ids, console_text=""):
+    """Contig 파일 개수로 결합을 추정하지 않고 ACE read 소속을 확인한다."""
+    combined = console_text + "\n" + files.get("reads.fasta.ace", "")
+    versions = sorted(set(re.findall(r"\bphrap\s+version\s+([0-9.]+)", combined, re.I)))
+    version = versions[0] if len(versions) == 1 else None
+    base = {
+        "version": version,
+        "version_matches": version == TARGET_PHRAP_VERSION,
+        "contigs": [], "singlets": [],
     }
-
-
-# --------------------------------------------------
-# Contig 생성 결과 판정
-# --------------------------------------------------
-def classify_contig_prediction(
-    overlap_result,
-    qt_threshold,
-    new_qt_threshold,
-    condition_label,
-):
-    """
-    서열 기반 overlap 근거와 실제 회사 프로그램 조건별 결과를
-    함께 사용하는 경험적 분류입니다.
-    """
-
-    if overlap_result is None:
-        return {
-            "status": "No contig 예상",
-            "rank": 0,
-            "reason": "terminal overlap 후보를 찾지 못함",
-        }
-
-    overlap_length = overlap_result["paired_bases"]
-    gap_included_identity = overlap_result[
-        "gap_included_identity"
-    ]
-    weighted_identity = overlap_result[
-        "quality_weighted_identity"
-    ]
-    qt_matches = overlap_result["qt_supported_matches"]
-    qt_longest_match_run = overlap_result[
-        "qt_supported_longest_match_run"
-    ]
-    qt_conflicts = overlap_result["qt_supported_conflicts"]
-    longest_gap_run = overlap_result.get(
-        "longest_gap_run",
-        overlap_result["gaps"],
-    )
-    total_slack = overlap_result["terminal_slack_total"]
-    terminal_high_quality = overlap_result[
-        "terminal_high_quality_bases"
-    ]
-    low_quality_fraction = overlap_result[
-        "terminal_low_quality_fraction"
-    ]
-    maximum_adjacent_softclip_mean = max(
-        overlap_result.get(
-            "forward_junction_softclip_adjacent_mean_quality",
-            0.0,
-        ),
-        overlap_result.get(
-            "reverse_junction_softclip_adjacent_mean_quality",
-            0.0,
-        ),
-    )
-    internal_overlap_mode = deep_internal_overlap_mode(
-        overlap_result,
-        qt_threshold,
-        new_qt_threshold,
-    )
-    internal_contig2_candidate = deep_internal_contig2_candidate(
-        overlap_result,
-        qt_threshold,
-        new_qt_threshold,
-    )
-    new_qt_enabled = new_qt_threshold is not None
-    boundary_label = (
-        f"New QT {new_qt_threshold}"
-        if new_qt_enabled
-        else f"QT {qt_threshold}"
-    )
-
-    structural_fail_reasons = []
-
-    if overlap_length < 20:
-        structural_fail_reasons.append("overlap 20 bp 미만")
-
-    if weighted_identity < 82:
-        structural_fail_reasons.append(
-            "Quality 가중 Identity 82% 미만"
-        )
-
-    if qt_matches < 10:
-        structural_fail_reasons.append(
-            f"Q{qt_threshold} 지지 match 10 bp 미만"
-        )
-
-    conflict_limit = max(25, int(qt_matches * 0.45))
-
-    if qt_conflicts > conflict_limit:
-        structural_fail_reasons.append(
-            f"고품질 mismatch/gap {qt_conflicts}개"
-        )
-
-    if (
-        total_slack > 350
-        and internal_overlap_mode is None
-        and not internal_contig2_candidate
-    ):
-        structural_fail_reasons.append(
-            f"junction soft-clip 후보 {total_slack} bp 초과"
-        )
-
-    if (
-        new_qt_enabled
-        and internal_overlap_mode is None
-        and not internal_contig2_candidate
-        and terminal_high_quality
-        > max(100, int(overlap_length * 0.75))
-    ):
-        structural_fail_reasons.append(
-            f"{boundary_label} 이상 말단 염기 "
-            f"{terminal_high_quality}개"
-        )
-
-    if structural_fail_reasons:
-        return {
-            "status": "No contig 예상",
-            "rank": 0,
-            "reason": "; ".join(structural_fail_reasons),
-        }
-
-    # 실제 보정 결과상 아래 조건은 contig 결과가 생성되지
-    # 않았습니다. 후속 사례가 쌓이면 이 prior를 재보정합니다.
-    if condition_label in NO_CONTIG_CALIBRATED_CONDITIONS:
-        return {
-            "status": "No contig 예상",
-            "rank": 0,
-            "reason": (
-                f"보정 사례에서 조건 {condition_label}은 No contig"
-            ),
-        }
-
-    bilateral_mode = bilateral_terminal_rescue_mode(
-        overlap_result, qt_threshold, new_qt_threshold,
-    )
-    if bilateral_mode is not None and condition_label in {"20/10", "30/20"}:
-        return bilateral_rescue_prediction(overlap_result, bilateral_mode, qt_threshold)
-
-    tight_conflict_limit = max(
-        20,
-        int(qt_matches * 0.35),
-    )
-
-    # 양 read가 junction에서 거의 바로 만나고 염기 일치도가
-    # 높은 구조입니다. 이 값은 구조적 지지 근거일 뿐, 모든 QT
-    # 조건을 성공으로 승격시키는 독립 기준으로 사용하지 않습니다.
-    tight_terminal_overlap = (
-        overlap_length >= 25
-        and overlap_result["base_identity"] >= 97
-        and weighted_identity >= 85
-        and qt_matches >= 20
-        and overlap_result["mismatches"] <= 2
-        and qt_conflicts <= tight_conflict_limit
-        and total_slack <= 20
-    )
-
-    pass_conflict_limit = max(8, int(qt_matches * 0.15))
-
-    terminal_pass = (
-        terminal_high_quality <= 30
-        and (
-            total_slack <= 20
-            or low_quality_fraction >= 0.65
-        )
-    )
-
-    pass_conditions = (
-        overlap_length >= 25
-        and weighted_identity >= 92
-        and qt_matches >= 20
-        and qt_conflicts <= pass_conflict_limit
-        and terminal_pass
-    )
-
-    # S-A 및 PW-41의 30/20 성공 사례처럼 junction에 비교적 긴
-    # 말단이 남아도 대부분이 New QT 미만이면 회사 프로그램이
-    # 저품질 말단을 제외한 뒤 조립하는 유형으로 해석합니다.
-    low_quality_terminal_rescue = (
-        overlap_length >= 200
-        and overlap_result["base_identity"] >= 98
-        and weighted_identity >= 92
-        and qt_matches >= 50
-        and qt_conflicts <= max(8, int(qt_matches * 0.15))
-        and 60 <= total_slack <= 180
-        and terminal_high_quality <= 30
-        and low_quality_fraction >= 0.70
-    )
-
-    # 긴 overlap 전체가 충분히 유사하고 두 read의 연결부가 깨끗하면,
-    # 내부에 분산된 gap 때문에 Q30 연속 match가 8 bp보다 짧아도
-    # 실제 회사 프로그램의 30/20 결합 가능 패턴으로 인정합니다.
-    # 짧은 overlap의 false positive와 QT16 오판에는 적용하지 않습니다.
-    long_gapped_30_20_evidence = (
-        overlap_length >= MIN_LONG_GAPPED_30_20_OVERLAP
-        and overlap_result["base_identity"] >= 97
-        and gap_included_identity
-        >= MIN_LONG_GAPPED_30_20_GAP_IDENTITY
-        and weighted_identity >= 92
-        and qt_matches >= 80
-        and qt_longest_match_run >= 6
-        and qt_conflicts <= max(20, int(qt_matches * 0.20))
-        and total_slack
-        <= MAX_LONG_GAPPED_30_20_TERMINAL_SLACK
-        and terminal_high_quality <= 10
-        and low_quality_fraction >= 0.75
-    )
-
-    # 긴 overlap에서 gap 총량만 보면 서로 다른 구조가 같은 점수를
-    # 받을 수 있습니다. KCKM 성공 사례는 gap이 최대 2 bp씩
-    # 분산됐지만 C_NS1/NS24 Contig2 사례는 4 bp 연속 gap이 있어
-    # consensus 연결부가 한 번에 크게 끊겼습니다. 따라서 장거리
-    # gap 보정형 성공은 연속 gap 2 bp 이하일 때만 허용합니다.
-    long_gapped_30_20_success = (
-        long_gapped_30_20_evidence
-        and longest_gap_run
-        <= MAX_LONG_GAPPED_30_20_GAP_RUN
-    )
-
-    fragmented_long_gapped_30_20_contig2 = (
-        long_gapped_30_20_evidence
-        and longest_gap_run
-        > MAX_LONG_GAPPED_30_20_GAP_RUN
-    )
-
-    reverse_orientation = overlap_result.get(
-        "reverse_orientation",
-        "",
-    )
-
-    read_profiles = sorted(
-        [
-            {
-                "length": overlap_result.get(
-                    "forward_read_length",
-                    0,
-                ),
-                "mean_quality": overlap_result.get(
-                    "forward_mean_quality",
-                    0.0,
-                ),
-                "q30_fraction": overlap_result.get(
-                    "forward_q30_fraction",
-                    0.0,
-                ),
-                "qt_readthrough": overlap_result.get(
-                    "forward_qt_readthrough",
-                    0,
-                ),
-            },
-            {
-                "length": overlap_result.get(
-                    "reverse_read_length",
-                    0,
-                ),
-                "mean_quality": overlap_result.get(
-                    "reverse_mean_quality",
-                    0.0,
-                ),
-                "q30_fraction": overlap_result.get(
-                    "reverse_q30_fraction",
-                    0.0,
-                ),
-                "qt_readthrough": overlap_result.get(
-                    "reverse_qt_readthrough",
-                    0,
-                ),
-            },
-        ],
-        key=lambda profile: profile["length"],
-    )
-    shorter_read, longer_read = read_profiles
-    read_length_asymmetry = (
-        longer_read["length"] - shorter_read["length"]
-    )
-
-    short_terminal_alignment = (
-        MIN_SHORT_TERMINAL_OVERLAP
-        <= overlap_length
-        <= MAX_SHORT_TERMINAL_OVERLAP
-        and overlap_result["base_identity"]
-        >= MIN_PRETRIMMED_BASE_IDENTITY
-        and gap_included_identity
-        >= MIN_PRETRIMMED_GAP_IDENTITY
-        and weighted_identity
-        >= MIN_PRETRIMMED_WEIGHTED_IDENTITY
-        and qt_matches >= MIN_PRETRIMMED_QT_MATCHES
-        and qt_longest_match_run
-        >= MIN_PRETRIMMED_LONGEST_RUN
-        and qt_conflicts <= MAX_PRETRIMMED_CONFLICTS
-        and overlap_result["gaps"] <= MAX_PRETRIMMED_GAPS
-        and longest_gap_run <= MAX_PRETRIMMED_GAP_RUN
-        and total_slack <= MAX_PRETRIMMED_TERMINAL_SLACK
-        and terminal_high_quality
-        <= MAX_PRETRIMMED_TERMINAL_HIGH_QUALITY
-    )
-
-    # 한쪽 read가 이미 짧고 깨끗하게 정리된 반면 반대쪽 read는 긴
-    # 비대칭 구조입니다. 두 read 모두 충분한 Q30 비율과 QT
-    # read-through를 가지면 75 bp 미만 overlap도 실제 프로그램에서
-    # 낮은 QT부터 결합될 수 있습니다.
-    pretrimmed_asymmetric_terminal_success = (
-        reverse_orientation == "Reverse-complement 적용"
-        and short_terminal_alignment
-        and read_length_asymmetry
-        >= MIN_PRETRIMMED_READ_LENGTH_ASYMMETRY
-        and shorter_read["length"]
-        <= MAX_PRETRIMMED_SHORT_READ_LENGTH
-        and longer_read["length"]
-        >= MIN_PRETRIMMED_LONG_READ_LENGTH
-        and shorter_read["mean_quality"]
-        >= MIN_PRETRIMMED_SHORT_READ_MEAN_QUALITY
-        and longer_read["mean_quality"]
-        >= MIN_PRETRIMMED_LONG_READ_MEAN_QUALITY
-        and min(
-            shorter_read["q30_fraction"],
-            longer_read["q30_fraction"],
-        )
-        >= MIN_PRETRIMMED_Q30_FRACTION
-        and min(
-            shorter_read["qt_readthrough"],
-            longer_read["qt_readthrough"],
-        )
-        >= MIN_PRETRIMMED_QT_READTHROUGH
-    )
-
-    # 양쪽 raw read가 모두 길어 낮은 QT에서는 저품질 tail이 남지만,
-    # Q30 core가 각각 650 bp 이상 유지되고 junction이 깨끗한 경우의
-    # 30/20 전용 short-overlap rescue입니다.
-    dual_long_qt30_short_overlap_success = (
-        condition_label == "30/20"
-        and reverse_orientation == "Reverse-complement 적용"
-        and MIN_SHORT_TERMINAL_OVERLAP
-        <= overlap_length
-        <= MAX_SHORT_TERMINAL_OVERLAP
-        and shorter_read["length"]
-        >= MIN_DUAL_LONG_QT30_READ_LENGTH
-        and min(
-            shorter_read["qt_readthrough"],
-            longer_read["qt_readthrough"],
-        )
-        >= MIN_DUAL_LONG_QT30_READTHROUGH
-        and overlap_result["base_identity"]
-        >= MIN_DUAL_LONG_QT30_BASE_IDENTITY
-        and gap_included_identity
-        >= MIN_DUAL_LONG_QT30_GAP_IDENTITY
-        and weighted_identity
-        >= MIN_DUAL_LONG_QT30_WEIGHTED_IDENTITY
-        and qt_matches >= MIN_DUAL_LONG_QT30_MATCHES
-        and qt_longest_match_run
-        >= MIN_DUAL_LONG_QT30_LONGEST_RUN
-        and qt_conflicts <= MAX_DUAL_LONG_QT30_CONFLICTS
-        and overlap_result["gaps"] <= MAX_DUAL_LONG_QT30_GAPS
-        and longest_gap_run <= MAX_DUAL_LONG_QT30_GAP_RUN
-        and total_slack
-        <= MAX_DUAL_LONG_QT30_TERMINAL_SLACK
-        and terminal_high_quality == 0
-    )
-
-    if (
-        condition_label in {"16", "20", "20/10"}
-        and pretrimmed_asymmetric_terminal_success
-    ):
-        return {
-            "status": "F+R 결합 성공 예상",
-            "rank": 2,
-            "reason": (
-                f"{condition_label} 사전 정리된 비대칭 read 성공 "
-                f"패턴 충족; terminal overlap {overlap_length} bp, "
-                f"read 길이 {shorter_read['length']}/"
-                f"{longer_read['length']} bp"
-            ),
-        }
-
-    # 현재 확인된 NS1/NS24 및 785F/907R 성공 패턴입니다.
-    # 일반 직접 결합형에는 최소 75 bp overlap을 요구합니다. 다만
-    # 위에서 확인한 사전 정리형 및 양쪽 긴 read의 Q30 core rescue는
-    # 전체 read 구조가 함께 충족될 때만 별도로 평가합니다.
-    direct_30_20_success = (
-        overlap_length >= MIN_DIRECT_30_20_OVERLAP
-        and qt_longest_match_run >= 8
-        and (pass_conditions or tight_terminal_overlap)
-    )
-
-    if (
-        condition_label == "30/20"
-        and reverse_orientation == "Reverse-complement 적용"
-        and (
-            direct_30_20_success
-            or low_quality_terminal_rescue
-            or long_gapped_30_20_success
-            or internal_overlap_mode is not None
-            or pretrimmed_asymmetric_terminal_success
-            or dual_long_qt30_short_overlap_success
-        )
-    ):
-        if pretrimmed_asymmetric_terminal_success:
-            success_basis = (
-                "30/20 사전 정리된 비대칭 read 성공 패턴 충족; "
-                f"terminal overlap {overlap_length} bp, read 길이 "
-                f"{shorter_read['length']}/{longer_read['length']} bp"
-            )
-        elif dual_long_qt30_short_overlap_success:
-            success_basis = (
-                "30/20 양쪽 긴 read의 고품질 core 성공 패턴 충족; "
-                f"terminal overlap {overlap_length} bp, Q30 "
-                f"read-through {shorter_read['qt_readthrough']}/"
-                f"{longer_read['qt_readthrough']} bp"
-            )
-        elif internal_overlap_mode is not None:
-            success_basis = (
-                f"30/20 {internal_overlap_mode} 성공 패턴 충족; "
-                f"Q{qt_threshold} 최장 연속 match "
-                f"{qt_longest_match_run} bp"
-            )
-        elif low_quality_terminal_rescue:
-            success_basis = (
-                "30/20 저품질 말단 soft-clip 성공 패턴 충족; "
-                f"말단 저품질 비율 {low_quality_fraction * 100:.1f}%"
-            )
-        elif long_gapped_30_20_success:
-            success_basis = (
-                "30/20 장거리 overlap과 깨끗한 junction 성공 패턴 "
-                f"충족; overlap {overlap_length} bp, gap 포함 "
-                f"Identity {gap_included_identity:.2f}%, Q"
-                f"{qt_threshold} 최장 연속 match "
-                f"{qt_longest_match_run} bp"
-            )
-        else:
-            success_basis = (
-                "30/20 연속 Quality anchor 성공 패턴 충족; "
-                f"Q{qt_threshold} 최장 연속 match "
-                f"{qt_longest_match_run} bp"
-            )
-
-        return {
-            "status": "F+R 결합 성공 예상",
-            "rank": 2,
-            "reason": success_basis,
-        }
-
-    # TTO M13의 실제 25/21 결합 성공 사례입니다. 긴 내부 overlap과
-    # 제거 가능한 양쪽 read-through가 함께 확인되는 경우에만 표준
-    # 성공 조건으로 인정합니다.
-    if (
-        condition_label == "25/21"
-        and reverse_orientation == "Reverse-complement 적용"
-        and internal_overlap_mode is not None
-    ):
-        return {
-            "status": "F+R 결합 성공 예상",
-            "rank": 2,
-            "reason": (
-                f"25/21 {internal_overlap_mode} 실제 성공 패턴 충족; "
-                f"Q{qt_threshold} 최장 연속 match "
-                f"{qt_longest_match_run} bp"
-            ),
-        }
-
-    # WT-260831-28 및 KNIBR033의 실제 30/20 Contig2 패턴입니다.
-    # Quality와 junction은 양호하지만 overlap 자체가 75 bp보다
-    # 짧아 하나의 안정적인 consensus로 승격되기에는 근거가
-    # 부족한 경우 F/R 개별 출력으로 분류합니다.
-    short_overlap_contig2 = (
-        condition_label == "30/20"
-        and reverse_orientation == "Reverse-complement 적용"
-        and MIN_CONTIG2_OVERLAP
-        <= overlap_length
-        < MIN_DIRECT_30_20_OVERLAP
-        and qt_longest_match_run >= 8
-        and (pass_conditions or tight_terminal_overlap)
-    )
-
-    if short_overlap_contig2:
-        return {
-            "status": "Contig2 예상",
-            "rank": 1,
-            "reason": (
-                "30/20 정렬 근거는 있으나 terminal overlap "
-                f"{overlap_length} bp로 {MIN_DIRECT_30_20_OVERLAP} "
-                "bp 미만; F/R 개별 출력 보정 패턴"
-            ),
-        }
-
-    if (
-        condition_label == "30/20"
-        and reverse_orientation == "Reverse-complement 적용"
-        and fragmented_long_gapped_30_20_contig2
-    ):
-        return {
-            "status": "Contig2 예상",
-            "rank": 1,
-            "reason": (
-                "30/20 장거리 overlap은 확인되지만 최장 연속 gap "
-                f"{longest_gap_run} bp로 허용 경계 "
-                f"{MAX_LONG_GAPPED_30_20_GAP_RUN} bp 초과; "
-                "연결부 단절 위험으로 F/R 개별 출력 보정 패턴"
-            ),
-        }
-
-    if (
-        condition_label == "30/20"
-        and internal_contig2_candidate
-    ):
-        return {
-            "status": "Contig2 예상",
-            "rank": 1,
-            "reason": (
-                "장거리 내부 overlap은 강하지만 30/20 말단 제거 "
-                "안정성 기준 미충족(저품질 말단 "
-                f"{low_quality_fraction * 100:.1f}%, gap 포함 Identity "
-                f"{gap_included_identity:.2f}%, junction 인접 soft-clip "
-                f"최대 평균 Q{maximum_adjacent_softclip_mean:.2f}); "
-                "F/R 개별 출력 보정 패턴"
-            ),
-        }
-
-    if (
-        condition_label == "25/21"
-        and internal_contig2_candidate
-    ):
-        return {
-            "status": "Contig2 예상",
-            "rank": 1,
-            "reason": (
-                "25/21 장거리 내부 overlap은 있으나 말단 제거 또는 "
-                "연속 anchor 안정성 기준 미충족(junction 인접 "
-                f"soft-clip 최대 평균 Q"
-                f"{maximum_adjacent_softclip_mean:.2f}); "
-                "F/R 개별 출력 예상"
-            ),
-        }
-
-    # 긴 read-through가 양쪽에 남은 read 쌍에서 내부 overlap이
-    # 매우 강하고 junction anchor가 깨끗한 경우입니다. WT-M13의
-    # 실제 20/10 성공 사례로 보정했지만 primer명은 사용하지 않아
-    # 같은 구조의 다른 서비스에도 적용됩니다.
-    if (
-        condition_label == "20/10"
-        and internal_overlap_mode is not None
-    ):
-        return {
-            "status": "F+R 결합 성공 예상",
-            "rank": 2,
-            "reason": (
-                f"20/10 {internal_overlap_mode} 성공 패턴 충족; "
-                f"Q{qt_threshold} 최장 연속 match "
-                f"{qt_longest_match_run} bp"
-            ),
-        }
-
-    if (
-        condition_label == "20/10"
-        and internal_contig2_candidate
-    ):
-        return {
-            "status": "Contig2 예상",
-            "rank": 1,
-            "reason": (
-                "장거리 내부 overlap은 강하지만 20/10 성공 안정성 "
-                f"기준 미충족(overlap {overlap_length} bp, junction "
-                f"read-through {total_slack} bp, Q20 최장 연속 match "
-                f"{qt_longest_match_run} bp); F/R 개별 출력 예상"
-            ),
-        }
-
-    # MPHKG-1의 실제 단독 QT20 결합 성공 패턴입니다. QT16에서는
-    # 69 bp의 짧은 overlap이라 Contig2였지만, QT20에서는 junction
-    # 밖의 17 bp가 모두 Q20 미만이고 overlap 내부가 깨끗해 하나의
-    # contig로 결합됐습니다. 파일명/primer명 대신 동일한 정렬 구조와
-    # Quality 경계를 모두 만족하는 경우에만 적용합니다.
-    qt20_trimmed_terminal_success = (
-        condition_label == "20"
-        and reverse_orientation == "Reverse-complement 적용"
-        and overlap_length >= MIN_QT20_TRIMMED_OVERLAP
-        and overlap_result["base_identity"]
-        >= MIN_QT20_TRIMMED_BASE_IDENTITY
-        and gap_included_identity
-        >= MIN_QT20_TRIMMED_GAP_IDENTITY
-        and weighted_identity
-        >= MIN_QT20_TRIMMED_WEIGHTED_IDENTITY
-        and qt_matches >= MIN_QT20_TRIMMED_MATCHES
-        and qt_longest_match_run
-        >= MIN_QT20_TRIMMED_LONGEST_RUN
-        and qt_conflicts <= MAX_QT20_TRIMMED_CONFLICTS
-        and overlap_result["gaps"] <= MAX_QT20_TRIMMED_GAPS
-        and longest_gap_run <= MAX_QT20_TRIMMED_GAP_RUN
-        and total_slack <= MAX_QT20_TRIMMED_TERMINAL_SLACK
-        and terminal_high_quality == 0
-        and low_quality_fraction
-        >= MIN_QT20_TRIMMED_LOW_QUALITY_FRACTION
-        and maximum_adjacent_softclip_mean
-        <= MAX_QT20_TRIMMED_ADJACENT_SOFTCLIP_MEAN
-    )
-
-    if qt20_trimmed_terminal_success:
-        return {
-            "status": "F+R 결합 성공 예상",
-            "rank": 2,
-            "reason": (
-                "QT20 저품질 말단 제거형 성공 패턴 충족; "
-                f"terminal overlap {overlap_length} bp, "
-                f"Q20 최장 연속 match {qt_longest_match_run} bp"
-            ),
-        }
-
-    # 16S 기본값인 QT16 단독 조건입니다. New QT를 사용하지 않고
-    # QT16을 말단 품질 경계로 삼아 구조적 overlap을 평가합니다.
-    # 일반형은 75 bp 이상의 직접 overlap과 gap 포함 Identity 90%
-    # 이상을 함께 요구합니다. 75 bp 미만은 앞에서 전체 read가 이미
-    # 짧고 깨끗하게 정리된 비대칭 성공 구조를 충족한 경우에만 먼저
-    # 성공 처리되며, 그 외에는 F/R 개별 출력으로 분류합니다.
-    qt16_direct_overlap = (
-        overlap_length >= MIN_DIRECT_QT16_OVERLAP
-        and gap_included_identity
-        >= MIN_QT16_GAP_INCLUDED_IDENTITY
-        and longest_gap_run <= MAX_QT16_GAP_RUN
-    )
-
-    qt16_only_success = (
-        condition_label == "16"
-        and qt16_direct_overlap
-        and overlap_result["base_identity"] >= 97
-        and weighted_identity >= 90
-        and qt_matches >= 25
-        and qt_longest_match_run >= 8
-        and qt_conflicts <= max(8, int(qt_matches * 0.20))
-        and (terminal_pass or tight_terminal_overlap)
-    )
-
-    if qt16_only_success:
-        return {
-            "status": "F+R 결합 성공 예상",
-            "rank": 2,
-            "reason": (
-                "QT16 단독 조건의 terminal overlap 기준 충족; "
-                f"Q16 최장 연속 match {qt_longest_match_run} bp"
-            ),
-        }
-
-    # HCU-A의 실제 QT10 성공 패턴입니다. Reverse 원본 방향에서
-    # 매우 직접적인 terminal overlap이 확인되는 경우에 한해
-    # QT10 성공 후보로 판정합니다.
-    if (
-        condition_label == "10"
-        and reverse_orientation == "원본 Reverse 방향 사용"
-        and tight_terminal_overlap
-    ):
-        return {
-            "status": "F+R 결합 성공 예상",
-            "rank": 2,
-            "reason": (
-                "QT10 성공 보정 패턴과 직접 terminal overlap 충족; "
-                f"junction 잔여 {total_slack} bp"
-            ),
-        }
-
-    # U126-A02-01 QT10 성공 사례처럼 reverse-complement 방향에서
-    # 긴 overlap과 직접 junction을 가지며 Q10 연속 anchor가 긴
-    # 패턴입니다. Q30에서는 anchor가 짧아져 30/20로 승격하지
-    # 않습니다.
-    qt10_long_anchor_profile = (
-        condition_label == "10"
-        and reverse_orientation == "Reverse-complement 적용"
-        and overlap_length >= 250
-        and overlap_result["base_identity"] >= 97
-        and weighted_identity >= 90
-        and total_slack <= 30
-        and qt_longest_match_run >= 30
-        and qt_conflicts <= max(45, int(qt_matches * 0.20))
-        and longest_gap_run <= MAX_QT10_LONG_ANCHOR_GAP_RUN
-    )
-
-    if qt10_long_anchor_profile:
-        return {
-            "status": "F+R 결합 성공 예상",
-            "rank": 2,
-            "reason": (
-                "QT10 장거리 terminal overlap과 연속 Quality "
-                f"anchor 충족; Q10 최장 연속 match "
-                f"{qt_longest_match_run} bp"
-            ),
-        }
-
-    if condition_label == "16":
-        qt16_reasons = []
-
-        if overlap_length < MIN_DIRECT_QT16_OVERLAP:
-            qt16_reasons.append(
-                f"terminal overlap {overlap_length} bp로 "
-                f"직접 결합 하한 {MIN_DIRECT_QT16_OVERLAP} bp 미만"
-            )
-
-        if (
-            overlap_length >= MIN_DIRECT_QT16_OVERLAP
-            and
-            gap_included_identity
-            < MIN_QT16_GAP_INCLUDED_IDENTITY
-        ):
-            qt16_reasons.append(
-                "gap 포함 Identity "
-                f"{gap_included_identity:.2f}%로 "
-                f"{MIN_QT16_GAP_INCLUDED_IDENTITY}% 미만"
-            )
-
-        if longest_gap_run > MAX_QT16_GAP_RUN:
-            qt16_reasons.append(
-                f"최장 연속 gap {longest_gap_run} bp로 "
-                f"허용 경계 {MAX_QT16_GAP_RUN} bp 초과"
-            )
-
-        if not qt16_reasons:
-            qt16_reasons.append(
-                "QT16 직접 결합용 Quality/junction 기준 미충족"
-            )
-
-        return {
-            "status": "Contig2 예상",
-            "rank": 1,
-            "reason": (
-                "QT16 단독 조건에서 overlap 후보는 있으나 "
-                + "; ".join(qt16_reasons)
-                + "; F/R 개별 출력 예상"
-            ),
-        }
-
-    if condition_label in CONTIG2_CALIBRATED_CONDITIONS:
-        return {
-            "status": "Contig2 예상",
-            "rank": 1,
-            "reason": (
-                f"조건 {condition_label}은 현재 보정 사례에서 "
-                "F/R 개별 출력 우선; junction 지표는 보조 근거"
-            ),
-        }
-
-    if (
-        condition_label in {"30/20", "25/21"}
-        and has_long_gapped_terminal_evidence(overlap_result)
-    ):
-        return {
-            "status": "Contig2 예상",
-            "rank": 1,
-            "reason": (
-                "긴 overlap은 있으나 gap/Quality 연결 기준 미충족; "
-                f"양측 Q{qt_threshold} 지지 최장 gap "
-                f"{overlap_result.get('qt_bilateral_longest_gap_run', longest_gap_run)} bp, "
-                f"Quality 가중 Identity {weighted_identity:.2f}%; F/R 개별 출력 예상"
-            ),
-        }
-
-    no_contig_reasons = []
-
-    if overlap_length < 25:
-        no_contig_reasons.append("overlap 25 bp 미만")
-
-    if weighted_identity < 92:
-        no_contig_reasons.append(
-            "Quality 가중 Identity 92% 미만"
-        )
-
-    if qt_matches < 20:
-        no_contig_reasons.append(
-            f"Q{qt_threshold} 지지 match 20 bp 미만"
-        )
-
-    if (
-        condition_label == "30/20"
-        and qt_longest_match_run < 8
-        and not low_quality_terminal_rescue
-    ):
-        no_contig_reasons.append(
-            f"Q{qt_threshold} 최장 연속 match 8 bp 미만"
-        )
-
-    if qt_conflicts > pass_conflict_limit:
-        no_contig_reasons.append(
-            f"고품질 mismatch/gap {qt_conflicts}개"
-        )
-
-    if not terminal_pass:
-        if new_qt_enabled:
-            no_contig_reasons.append(
-                f"{boundary_label} 이상 soft-clip 염기 "
-                f"{terminal_high_quality}개"
-            )
-        else:
-            no_contig_reasons.append(
-                f"{boundary_label} 단독 조건의 junction 경계 미충족"
-            )
-
-    return {
-        "status": "No contig 예상",
-        "rank": 0,
-        "reason": "; ".join(no_contig_reasons),
-    }
-
-
-def classify_exploratory_prediction(
-    overlap_result,
-    qt_threshold,
-    new_qt_threshold,
-):
-    """
-    실제 결과로 직접 보정되지 않은 확장 QT 조합을 구조적으로
-    평가합니다. 단일 지표가 아니라 overlap, gap 포함 Identity,
-    Quality anchor, junction을 모두 통과해야 성공 후보가 됩니다.
-    """
-
-    if overlap_result is None:
-        return {
-            "status": "No contig 예상",
-            "rank": 0,
-            "reason": "terminal overlap 후보를 찾지 못함",
-        }
-
-    overlap_length = overlap_result["paired_bases"]
-    base_identity = overlap_result["base_identity"]
-    gap_identity = overlap_result["gap_included_identity"]
-    weighted_identity = overlap_result[
-        "quality_weighted_identity"
-    ]
-    qt_matches = overlap_result["qt_supported_matches"]
-    longest_run = overlap_result[
-        "qt_supported_longest_match_run"
-    ]
-    conflicts = overlap_result["qt_supported_conflicts"]
-    gaps = overlap_result["gaps"]
-    terminal_slack = overlap_result["terminal_slack_total"]
-    terminal_high_quality = overlap_result[
-        "terminal_high_quality_bases"
-    ]
-    low_quality_fraction = overlap_result[
-        "terminal_low_quality_fraction"
-    ]
-    maximum_adjacent_softclip_mean = max(
-        overlap_result.get(
-            "forward_junction_softclip_adjacent_mean_quality",
-            0.0,
-        ),
-        overlap_result.get(
-            "reverse_junction_softclip_adjacent_mean_quality",
-            0.0,
-        ),
-    )
-    internal_overlap_mode = deep_internal_overlap_mode(
-        overlap_result,
-        qt_threshold,
-        new_qt_threshold,
-    )
-    internal_contig2_candidate = deep_internal_contig2_candidate(
-        overlap_result,
-        qt_threshold,
-        new_qt_threshold,
-    )
-
-    hard_failures = []
-
-    if overlap_length < 20:
-        hard_failures.append("overlap 20 bp 미만")
-
-    if weighted_identity < 82:
-        hard_failures.append("Quality 가중 Identity 82% 미만")
-
-    if qt_matches < 10:
-        hard_failures.append(
-            f"Q{qt_threshold} 지지 match 10 bp 미만"
-        )
-
-    if conflicts > max(25, int(qt_matches * 0.45)):
-        hard_failures.append(
-            f"고품질 mismatch/gap {conflicts}개"
-        )
-
-    if (
-        terminal_slack > 350
-        and internal_overlap_mode is None
-        and not internal_contig2_candidate
-    ):
-        hard_failures.append(
-            f"junction soft-clip {terminal_slack} bp 초과"
-        )
-
-    if hard_failures:
-        return {
-            "status": "No contig 예상",
-            "rank": 0,
-            "reason": "; ".join(hard_failures),
-        }
-
-    bilateral_mode = bilateral_terminal_rescue_mode(
-        overlap_result, qt_threshold, new_qt_threshold,
-    )
-    if bilateral_mode is not None:
-        return bilateral_rescue_prediction(overlap_result, bilateral_mode, qt_threshold)
-
-    terminal_pass = (
-        terminal_high_quality <= 30
-        and (
-            terminal_slack <= 20
-            or low_quality_fraction >= 0.65
-        )
-    )
-
-    direct_success = (
-        overlap_length >= MIN_DIRECT_30_20_OVERLAP
-        and base_identity >= 97
-        and gap_identity >= 90
-        and weighted_identity >= 92
-        and qt_matches >= 25
-        and longest_run >= 8
-        and conflicts <= max(8, int(qt_matches * 0.15))
-        and terminal_pass
-    )
-
-    low_quality_terminal_rescue = (
-        new_qt_threshold is not None
-        and overlap_length >= 200
-        and base_identity >= 98
-        and gap_identity >= 88
-        and weighted_identity >= 92
-        and qt_matches >= 50
-        and longest_run >= 8
-        and conflicts <= max(8, int(qt_matches * 0.15))
-        and 60 <= terminal_slack <= 180
-        and terminal_high_quality <= 30
-        and low_quality_fraction >= 0.70
-    )
-
-    if (
-        direct_success
-        or low_quality_terminal_rescue
-        or internal_overlap_mode is not None
-    ):
-        if internal_overlap_mode is not None:
-            success_reason = (
-                f"확장 조건의 {internal_overlap_mode} 충족; "
-                f"Q{qt_threshold} 최장 연속 match "
-                f"{longest_run} bp"
-            )
-        elif low_quality_terminal_rescue:
-            success_reason = (
-                "확장 조건의 저품질 말단 제외 패턴 충족; "
-                f"soft-clip 저품질 비율 "
-                f"{low_quality_fraction * 100:.1f}%"
-            )
-        else:
-            success_reason = (
-                "확장 조건의 직접 terminal overlap 충족; "
-                f"Q{qt_threshold} 최장 연속 match "
-                f"{longest_run} bp"
-            )
-
-        return {
-            "status": "F+R 결합 성공 예상",
-            "rank": 2,
-            "reason": success_reason,
-        }
-
-    if internal_contig2_candidate:
-        return {
-            "status": "Contig2 예상",
-            "rank": 1,
-            "reason": (
-                "장거리 내부 overlap은 강하지만 말단 제거 또는 Q"
-                f"{qt_threshold} 연속 anchor 안정성 기준 미충족; "
-                "junction 인접 soft-clip 최대 평균 Q"
-                f"{maximum_adjacent_softclip_mean:.2f}"
-            ),
-        }
-
-    contig2_candidate = (
-        overlap_length >= 40
-        and base_identity >= 95
-        and weighted_identity >= 85
-        and qt_matches >= 15
-    )
-
-    if contig2_candidate:
-        return {
-            "status": "Contig2 예상",
-            "rank": 1,
-            "reason": (
-                "overlap 후보는 있으나 확장 조건의 직접 결합 기준 "
-                "또는 인접 조건 안정성 확인 필요"
-            ),
-        }
-
-    return {
-        "status": "No contig 예상",
-        "rank": 0,
-        "reason": (
-            "확장 조건에서 안정적인 terminal overlap 근거 부족"
-        ),
-    }
-
-
-# --------------------------------------------------
-# 재반응 방향 및 기대 효과 평가
-# --------------------------------------------------
-def estimate_quality_readthrough(
-    qualities,
-    threshold=20,
-    window_size=20,
-):
-    """마지막으로 안정적인 Quality window가 끝나는 위치를 구합니다."""
-
-    if not qualities:
-        return 0
-
-    if len(qualities) < window_size:
-        average_quality = sum(qualities) / len(qualities)
-        supported_fraction = sum(
-            quality >= threshold
-            for quality in qualities
-        ) / len(qualities)
-
-        if average_quality >= threshold and supported_fraction >= 0.70:
-            return len(qualities)
-
-        return 0
-
-    last_supported_end = 0
-
-    for start in range(0, len(qualities) - window_size + 1):
-        quality_window = qualities[start:start + window_size]
-        average_quality = sum(quality_window) / window_size
-        supported_fraction = sum(
-            quality >= threshold
-            for quality in quality_window
-        ) / window_size
-
-        if average_quality >= threshold and supported_fraction >= 0.70:
-            last_supported_end = start + window_size
-
-    return last_supported_end
-
-
-def build_reaction_quality_profile(
-    read_data,
-    source_name,
-    overlap_result,
-    qt_threshold,
-):
-    """재반응 필요도를 read별로 계산하는 경험적 품질 프로필입니다."""
-
-    sequence = normalize_alignment_sequence(read_data["sequence"])
-    qualities = normalize_quality_scores(
-        sequence,
-        read_data["quality_scores"],
-    )
-    read_length = len(sequence)
-
-    if read_length > 0:
-        average_quality = sum(qualities) / read_length
-        q20_fraction = sum(
-            quality >= 20
-            for quality in qualities
-        ) / read_length
-        q30_fraction = sum(
-            quality >= 30
-            for quality in qualities
-        ) / read_length
-        ambiguous_fraction = sequence.count("N") / read_length
-    else:
-        average_quality = 0.0
-        q20_fraction = 0.0
-        q30_fraction = 0.0
-        ambiguous_fraction = 1.0
-
-    readthrough_length = estimate_quality_readthrough(
-        qualities,
-        threshold=20,
-    )
-    readthrough_fraction = (
-        readthrough_length / read_length
-        if read_length > 0
-        else 0.0
-    )
-
-    source_key = source_name.lower()
-    junction_softclip = 0
-    junction_high_quality_softclip = 0
-    junction_low_quality_softclip = 0
-    junction_anchor_mean_quality = 0.0
-    junction_anchor_qt_fraction = 0.0
-
-    if overlap_result is not None:
-        junction_softclip = overlap_result.get(
-            f"{source_key}_junction_softclip",
-            0,
-        )
-        junction_high_quality_softclip = overlap_result.get(
-            f"{source_key}_junction_high_quality_softclip",
-            0,
-        )
-        junction_low_quality_softclip = overlap_result.get(
-            f"{source_key}_junction_low_quality_softclip",
-            0,
-        )
-        junction_anchor_mean_quality = overlap_result.get(
-            f"{source_key}_junction_anchor_mean_quality",
-            0.0,
-        )
-        junction_anchor_qt_fraction = overlap_result.get(
-            f"{source_key}_junction_anchor_qt_fraction",
-            0.0,
-        )
-
-    need_score = 0
-    need_reasons = []
-
-    if average_quality < 20:
-        need_score += 3
-        need_reasons.append("평균 Quality 낮음")
-    elif average_quality < 28:
-        need_score += 1
-        need_reasons.append("평균 Quality 경계")
-
-    if q20_fraction < 0.45:
-        need_score += 3
-        need_reasons.append("Q20 염기 비율 낮음")
-    elif q20_fraction < 0.65:
-        need_score += 1
-        need_reasons.append("Q20 염기 비율 경계")
-
-    if q30_fraction < 0.20:
-        need_score += 2
-        need_reasons.append("Q30 염기 비율 낮음")
-    elif q30_fraction < 0.40:
-        need_score += 1
-        need_reasons.append("Q30 염기 비율 경계")
-
-    if readthrough_fraction < 0.45:
-        need_score += 3
-        need_reasons.append("Q20 read-through 짧음")
-    elif readthrough_fraction < 0.70:
-        need_score += 1
-        need_reasons.append("Q20 read-through 경계")
-
-    if ambiguous_fraction > 0.05:
-        need_score += 3
-        need_reasons.append("N 염기 비율 높음")
-    elif ambiguous_fraction > 0.02:
-        need_score += 1
-        need_reasons.append("N 염기 존재")
-
-    if overlap_result is not None:
-        if junction_anchor_mean_quality < max(10, qt_threshold - 5):
-            need_score += 3
-            need_reasons.append("junction anchor Quality 낮음")
-        elif junction_anchor_mean_quality < qt_threshold:
-            need_score += 2
-            need_reasons.append("junction anchor Quality 부족")
-        elif junction_anchor_mean_quality < qt_threshold + 5:
-            need_score += 1
-            need_reasons.append("junction anchor Quality 경계")
-
-        if junction_anchor_qt_fraction < 0.35:
-            need_score += 3
-            need_reasons.append("junction QT 지지율 낮음")
-        elif junction_anchor_qt_fraction < 0.65:
-            need_score += 2
-            need_reasons.append("junction QT 지지율 부족")
-        elif junction_anchor_qt_fraction < 0.80:
-            need_score += 1
-            need_reasons.append("junction QT 지지율 경계")
-
-        if junction_low_quality_softclip >= 50:
-            need_score += 2
-            need_reasons.append("저품질 junction 말단 김")
-        elif junction_low_quality_softclip >= 15:
-            need_score += 1
-            need_reasons.append("저품질 junction 말단 존재")
-
-    if need_score >= 7:
-        need_level = "높음"
-    elif need_score >= 2:
-        need_level = "중간"
-    else:
-        need_level = "낮음"
-
-    return {
-        "source": source_name,
-        "need_score": need_score,
-        "need_level": need_level,
-        "need_reasons": need_reasons,
-        "read_length": read_length,
-        "average_quality": round(average_quality, 2),
-        "q20_fraction": round(q20_fraction, 4),
-        "q30_fraction": round(q30_fraction, 4),
-        "readthrough_length": readthrough_length,
-        "readthrough_fraction": round(readthrough_fraction, 4),
-        "ambiguous_fraction": round(ambiguous_fraction, 4),
-        "junction_softclip": junction_softclip,
-        "junction_high_quality_softclip": (
-            junction_high_quality_softclip
-        ),
-        "junction_low_quality_softclip": (
-            junction_low_quality_softclip
-        ),
-        "junction_anchor_mean_quality": round(
-            junction_anchor_mean_quality,
-            2,
-        ),
-        "junction_anchor_qt_fraction": round(
-            junction_anchor_qt_fraction,
-            4,
-        ),
-    }
-
-
-def evaluate_structural_support(overlap_result, qt_threshold):
-    """재반응으로 회복 가능한 overlap 구조인지 3단계로 평가합니다."""
-
-    if overlap_result is None:
-        return {
-            "level": "낮음",
-            "score": 0,
-            "reason": "terminal overlap 후보가 없습니다.",
-        }
-
-    overlap_length = overlap_result["paired_bases"]
-    base_identity = overlap_result["base_identity"]
-    weighted_identity = overlap_result["quality_weighted_identity"]
-    qt_matches = overlap_result["qt_supported_matches"]
-    qt_conflicts = overlap_result["qt_supported_conflicts"]
-    terminal_high_quality = overlap_result[
-        "terminal_high_quality_bases"
-    ]
-
-    support_score = 0
-
-    if overlap_length >= MIN_DIRECT_30_20_OVERLAP:
-        support_score += 2
-    elif overlap_length >= 35:
-        support_score += 1
-
-    if base_identity >= 97:
-        support_score += 2
-    elif base_identity >= 90:
-        support_score += 1
-
-    if weighted_identity >= 92:
-        support_score += 2
-    elif weighted_identity >= 85:
-        support_score += 1
-
-    if qt_matches >= 30:
-        support_score += 2
-    elif qt_matches >= 15:
-        support_score += 1
-
-    if qt_conflicts <= max(5, int(qt_matches * 0.15)):
-        support_score += 1
-
-    if terminal_high_quality <= 30:
-        support_score += 1
-
-    if support_score >= 8:
-        support_level = "높음"
-    elif support_score >= 5:
-        support_level = "중간"
-    else:
-        support_level = "낮음"
-
-    return {
-        "level": support_level,
-        "score": support_score,
-        "reason": (
-            f"terminal overlap {overlap_length} bp, "
-            f"Quality 가중 Identity {weighted_identity}%, "
-            f"Q{qt_threshold} 지지 match {qt_matches} bp"
-        ),
-    }
-
-
-def expectation_level(score):
-    if score >= 2:
-        return "높음"
-    if score >= 1:
-        return "중간"
-    return "낮음"
-
-
-def evaluate_rerun_scenarios(
-    forward_data,
-    reverse_data,
-    overlap_result,
-    current_prediction,
-    simulation_rows,
-    selected_condition,
-    qt_threshold,
-):
-    """
-    현재 AB1에서 품질 제한 방향과 구조적 overlap 가능성을 분리해
-    F/R 재반응의 상대적 기대 효과를 제시합니다.
-    """
-
-    forward_profile = build_reaction_quality_profile(
-        forward_data,
-        "Forward",
-        overlap_result,
-        qt_threshold,
-    )
-    reverse_profile = build_reaction_quality_profile(
-        reverse_data,
-        "Reverse",
-        overlap_result,
-        qt_threshold,
-    )
-    structural_support = evaluate_structural_support(
-        overlap_result,
-        qt_threshold,
-    )
-
-    successful_conditions = [
-        row["조건"]
-        for row in simulation_rows
-        if row["Contig 예측"] == "F+R 결합 성공 예상"
-    ]
-    current_success = (
-        current_prediction["status"] == "F+R 결합 성공 예상"
-    )
-    alternative_successes = [
-        condition
-        for condition in successful_conditions
-        if condition != selected_condition
-    ]
-
-    if current_success:
-        recommendation = "재반응 불필요"
-        recommendation_reason = (
-            f"현재 조건 {selected_condition}에서 F+R 결합 성공이 "
-            "예상됩니다."
-        )
-        forward_effect = 0
-        reverse_effect = 0
-        both_effect = 0
-        failure_risk = 0
-        confidence = "높음"
-
-    elif alternative_successes:
-        preferred_condition = alternative_successes[0]
-        recommendation = f"조건 {preferred_condition} 적용 우선"
-        recommendation_reason = (
-            "재반응 전에 동일 AB1의 성공 예상 조건을 먼저 적용하는 "
-            "편이 효율적입니다."
-        )
-        forward_effect = 0
-        reverse_effect = 0
-        both_effect = 0
-        failure_risk = 0
-        confidence = "중간"
-
-    else:
-        forward_need = forward_profile["need_score"]
-        reverse_need = reverse_profile["need_score"]
-        structural_score = structural_support["score"]
-
-        def one_side_effect(side_need, other_need):
-            if structural_score < 5:
-                return 1 if side_need >= 7 and other_need < 7 else 0
-
-            if side_need >= 7 and other_need < 7:
-                return 2
-
-            if (
-                side_need >= 4
-                and side_need - other_need >= 2
-            ):
-                return 2 if structural_score >= 8 else 1
-
-            if (
-                side_need >= 2
-                and side_need - other_need >= 2
-            ):
-                return 1
-
-            if side_need >= 3:
-                return 1
-
-            return 0
-
-        forward_effect = one_side_effect(
-            forward_need,
-            reverse_need,
-        )
-        reverse_effect = one_side_effect(
-            reverse_need,
-            forward_need,
-        )
-
-        if structural_score >= 8 and min(
-            forward_need,
-            reverse_need,
-        ) >= 3:
-            both_effect = 2
-        elif structural_score >= 5 and max(
-            forward_need,
-            reverse_need,
-        ) >= 3:
-            both_effect = 1
-        elif structural_score < 5 and min(
-            forward_need,
-            reverse_need,
-        ) >= 7:
-            both_effect = 1
-        else:
-            both_effect = 0
-
-        if structural_score < 5:
-            failure_risk = 2
-        elif (
-            forward_need < 2
-            and reverse_need < 2
-            and not current_success
-        ):
-            failure_risk = 2
-        elif structural_score < 8:
-            failure_risk = 1
-        elif max(forward_need, reverse_need) >= 7:
-            failure_risk = 0
-        else:
-            failure_risk = 1
-
-        if failure_risk >= 2 and max(
-            forward_effect,
-            reverse_effect,
-            both_effect,
-        ) == 0:
-            recommendation = "단순 재반응 효과 낮음"
-            recommendation_reason = (
-                "품질보다 pairing, primer, 혼합 template 또는 "
-                "구조적 overlap 문제를 먼저 확인해야 합니다."
-            )
-        elif (
-            both_effect > max(forward_effect, reverse_effect)
-            or (
-                both_effect >= 1
-                and abs(forward_need - reverse_need) <= 1
-                and min(forward_need, reverse_need) >= 3
-            )
-        ):
-            recommendation = "양방향 재반응 권장"
-            recommendation_reason = (
-                "F와 R 모두 품질 보완 필요성이 확인됩니다."
-            )
-        elif forward_effect > reverse_effect:
-            recommendation = "Forward만 재반응 우선"
-            recommendation_reason = (
-                "Forward가 Reverse보다 결합 제한 요인으로 평가됩니다."
-            )
-        elif reverse_effect > forward_effect:
-            recommendation = "Reverse만 재반응 우선"
-            recommendation_reason = (
-                "Reverse가 Forward보다 결합 제한 요인으로 평가됩니다."
-            )
-        elif forward_profile["need_score"] > reverse_profile["need_score"]:
-            recommendation = "Forward만 재반응 검토"
-            recommendation_reason = (
-                "Forward의 상대적 품질 보완 필요성이 더 큽니다."
-            )
-        elif reverse_profile["need_score"] > forward_profile["need_score"]:
-            recommendation = "Reverse만 재반응 검토"
-            recommendation_reason = (
-                "Reverse의 상대적 품질 보완 필요성이 더 큽니다."
-            )
-        else:
-            recommendation = "양방향 재반응 검토"
-            recommendation_reason = (
-                "한 방향만을 우선할 근거가 충분하지 않습니다."
-            )
-
-        if structural_score >= 8 and abs(
-            forward_need - reverse_need
-        ) >= 5:
-            confidence = "높음"
-        elif structural_score >= 5:
-            confidence = "중간"
-        else:
-            confidence = "낮음"
-
-    forward_reason = (
-        f"F 재반응 필요도 {forward_profile['need_level']} · "
-        f"Q20 {forward_profile['q20_fraction'] * 100:.1f}% · "
-        f"Q20 read-through {forward_profile['readthrough_length']} bp"
-    )
-    reverse_reason = (
-        f"R 재반응 필요도 {reverse_profile['need_level']} · "
-        f"Q20 {reverse_profile['q20_fraction'] * 100:.1f}% · "
-        f"Q20 read-through {reverse_profile['readthrough_length']} bp"
-    )
-
-    return {
-        "recommendation": recommendation,
-        "recommendation_reason": recommendation_reason,
-        "confidence": confidence,
-        "structural_support": structural_support,
-        "forward_profile": forward_profile,
-        "reverse_profile": reverse_profile,
-        "scenarios": [
-            {
-                "name": "F만 재반응",
-                "level": expectation_level(forward_effect),
-                "kind": "benefit",
-                "reason": forward_reason,
-            },
-            {
-                "name": "R만 재반응",
-                "level": expectation_level(reverse_effect),
-                "kind": "benefit",
-                "reason": reverse_reason,
-            },
-            {
-                "name": "양방향 재반응",
-                "level": expectation_level(both_effect),
-                "kind": "benefit",
-                "reason": (
-                    "양쪽 read의 품질 제한을 동시에 보완했을 때의 "
-                    "상대적 기대 효과"
-                ),
-            },
-            {
-                "name": "재반응 후 결합 실패",
-                "level": expectation_level(failure_risk),
-                "kind": "risk",
-                "reason": structural_support["reason"],
-            },
-        ],
-    }
-
-
-# --------------------------------------------------
-# 조건 시뮬레이션 및 범위 탐색
-# --------------------------------------------------
-def empty_overlap_result():
-    return {
-        "paired_bases": 0,
-        "base_identity": 0,
-        "gap_included_identity": 0,
-        "quality_weighted_identity": 0,
-        "gaps": 0,
-        "longest_gap_run": 0,
-        "qt_supported_matches": 0,
-        "qt_supported_longest_match_run": 0,
-        "qt_supported_conflicts": 0,
-        "qt_bilateral_gap_bases": 0,
-        "qt_bilateral_longest_gap_run": 0,
-        "qt_bilateral_conflicts": 0,
-        "connection_direction": "-",
-        "reverse_orientation": "-",
-        "left_tail_unaligned": None,
-        "right_head_unaligned": None,
-        "terminal_high_quality_bases": None,
-        "terminal_low_quality_fraction": 0,
-        "forward_junction_softclip_adjacent_mean_quality": 0,
-        "reverse_junction_softclip_adjacent_mean_quality": 0,
-    }
-
-
-def evaluate_condition_values(
-    forward_data,
-    reverse_data,
-    qt_value,
-    current_new_qt,
-):
-    calibrated_label = standard_condition_label(
-        qt_value,
-        current_new_qt,
-    )
-    condition_label = (
-        calibrated_label
-        if calibrated_label is not None
-        else format_condition_label(qt_value, current_new_qt)
-    )
-
-    overlap_result = analyze_best_reverse_orientation(
-        forward_data["sequence"],
-        forward_data["quality_scores"],
-        reverse_data["sequence"],
-        reverse_data["quality_scores"],
-        qt_value,
-        current_new_qt,
-    )
-
-    if calibrated_label is not None:
-        prediction = classify_contig_prediction(
-            overlap_result,
-            qt_value,
-            current_new_qt,
-            calibrated_label,
-        )
-        condition_type = "표준"
-        condition_order = COMPANY_CONDITIONS.index(
-            calibrated_label
-        )
-    else:
-        prediction = classify_exploratory_prediction(
-            overlap_result,
-            qt_value,
-            current_new_qt,
-        )
-        condition_type = "확장"
-        condition_order = 1000 + qt_value * 100 + (
-            -1 if current_new_qt is None else current_new_qt
-        )
-
-    safe_overlap = (
-        overlap_result
-        if overlap_result is not None
-        else empty_overlap_result()
-    )
-
-    return {
-        "조건": condition_label,
-        "조건 유형": condition_type,
-        "QT": qt_value,
-        "New QT": (
-            "미사용"
-            if current_new_qt is None
-            else str(current_new_qt)
-        ),
-        "Overlap": safe_overlap["paired_bases"],
-        "Gap 제외 Identity (%)": safe_overlap["base_identity"],
-        "Gap 포함 Identity (%)": safe_overlap[
-            "gap_included_identity"
-        ],
-        "Quality 가중 Identity (%)": safe_overlap[
-            "quality_weighted_identity"
-        ],
-        "QT 지지 Match": safe_overlap[
-            "qt_supported_matches"
-        ],
-        "QT 최장 연속 Match": safe_overlap[
-            "qt_supported_longest_match_run"
-        ],
-        "고품질 Mismatch/Gap": safe_overlap[
-            "qt_supported_conflicts"
-        ],
-        "Gap": safe_overlap["gaps"],
-        "최장 연속 Gap": safe_overlap["longest_gap_run"],
-        "양측 QT 지지 최장 Gap": safe_overlap["qt_bilateral_longest_gap_run"],
-        "양측 QT 지지 충돌": safe_overlap["qt_bilateral_conflicts"],
-        "연결 방향": safe_overlap["connection_direction"],
-        "Reverse 처리": safe_overlap["reverse_orientation"],
-        "왼쪽 junction soft-clip": safe_overlap[
-            "left_tail_unaligned"
-        ],
-        "오른쪽 junction soft-clip": safe_overlap[
-            "right_head_unaligned"
-        ],
-        "경계 기준 이상 soft-clip 염기": safe_overlap[
-            "terminal_high_quality_bases"
-        ],
-        "soft-clip 저품질 비율 (%)": round(
-            safe_overlap["terminal_low_quality_fraction"] * 100,
-            2,
-        ),
-        "Junction 인접 soft-clip 최대 평균 Q": max(
-            safe_overlap[
-                "forward_junction_softclip_adjacent_mean_quality"
-            ],
-            safe_overlap[
-                "reverse_junction_softclip_adjacent_mean_quality"
-            ],
-        ),
-        "Contig 예측": prediction["status"],
-        "인접 성공": "-",
-        "추천 안정성": "-",
-        "판정 근거": prediction["reason"],
-        "_rank": prediction["rank"],
-        "_condition_order": condition_order,
-        "_qt_value": qt_value,
-        "_new_qt_value": current_new_qt,
-        "_standard": calibrated_label is not None,
-        "_neighbor_success": 0,
-        "_neighbor_total": 0,
-        "_stability_rank": 0,
-    }
-
-
-def sort_simulation_rows(rows):
-    return sorted(
-        rows,
-        key=lambda row: (
-            -row["_rank"],
-            -int(row.get("_standard", False)),
-            -row.get("_stability_rank", 0),
-            -row["Quality 가중 Identity (%)"],
-            -row["Gap 포함 Identity (%)"],
-            -row["QT 지지 Match"],
-            row["경계 기준 이상 soft-clip 염기"]
-            if row["경계 기준 이상 soft-clip 염기"] is not None
-            else float("inf"),
-            -row["Overlap"],
-            row["_condition_order"],
-        ),
-    )
-
-
-def simulate_company_conditions(
-    forward_data,
-    reverse_data,
-    condition_labels,
-):
+    if "reads.fasta.ace" not in files:
+        return dict(base, state="unreadable", label="ACE 출력 없음 · 결합 판단 불가")
+    try:
+        ace = Ace.read(io.StringIO(files["reads.fasta.ace"]))
+        groups = []
+        for contig in ace.contigs:
+            members = {read.rd.name for read in contig.reads}
+            groups.append({"name": contig.name, "members": sorted(members), "bases": contig.nbases})
+        singles = read_fasta_ids(files.get("reads.fasta.singlets", ""))
+    except (ValueError, AssertionError, IndexError, StopIteration) as exc:
+        return dict(base, state="unreadable", label=f"phrap 출력 해석 실패: {exc}")
+    base.update(contigs=groups, singlets=sorted(singles))
+    expected = set(read_ids)
+    if any(expected <= set(group["members"]) for group in groups):
+        return dict(base, state="joined", label="F/R 동일 contig 확인")
+    seen = singles | {member for group in groups for member in group["members"]}
+    if expected <= seen:
+        return dict(base, state="separate", label="F/R 분리 출력 확인")
+    missing = sorted(expected - seen)
+    return dict(base, state="incomplete", label="일부 read 출력 미확인: " + ", ".join(missing))
+
+
+def run_phrap(packet, executable, options="", timeout=60):
+    if any(not read.sequence for read in packet["reads"]):
+        return {"state": "skipped", "label": "빈 read 포함 · phrap 미실행", "files": {},
+                "version": None, "version_matches": False, "log": ""}
+    path = resolve_phrap(executable)
+    args = [path, "reads.fasta", "-new_ace", *split_phrap_options(options)]
+    with tempfile.TemporaryDirectory(prefix="contig_phrap_") as tmp:
+        directory = Path(tmp)
+        (directory / "reads.fasta").write_bytes(packet["fasta"])
+        (directory / "reads.fasta.qual").write_bytes(packet["qual"])
+        try:
+            process = subprocess.run(args, cwd=directory, capture_output=True,
+                text=True, errors="replace", timeout=timeout, shell=False)
+        except subprocess.TimeoutExpired:
+            return {"state": "error", "label": "phrap 실행 시간 초과", "files": {},
+                    "version": None, "version_matches": False, "log": "timeout", "command": args}
+        log = process.stdout + "\n" + process.stderr
+        files = {}
+        for suffix in ("ace", "contigs", "contigs.qual", "singlets", "log", "problems"):
+            output = directory / f"reads.fasta.{suffix}"
+            if output.is_file() and output.stat().st_size <= MAX_UPLOAD_BYTES:
+                files[output.name] = output.read_text(errors="replace")
+        if process.returncode:
+            return {"state": "error", "label": f"phrap 실행 오류 (종료 코드 {process.returncode})",
+                    "files": files, "version": None, "version_matches": False,
+                    "log": log, "command": args}
+        result = parse_phrap_outputs(files, [r.name for r in packet["reads"]], log)
+        result.update(files=files, log=log, command=args)
+        return result
+
+
+def analyze_packets(packets, executable=None, options=""):
+    if executable is not None:
+        # 4회 실행 전에 설정 오류를 먼저 보고한다.
+        resolve_phrap(executable)
+        split_phrap_options(options)
     rows = []
-    requested = set(condition_labels)
-
-    for condition_label in COMPANY_CONDITIONS:
-        if condition_label not in requested:
+    for condition in CONDITIONS:
+        packet = packets.get(condition.label)
+        if packet is None:
+            rows.append({"condition": asdict(condition), "available": False,
+                         "label": "해당 조건 입력 없음"})
             continue
-
-        qt_value, current_new_qt = parse_company_condition(
-            condition_label
-        )
-        rows.append(
-            evaluate_condition_values(
-                forward_data,
-                reverse_data,
-                qt_value,
-                current_new_qt,
-            )
-        )
-
-    return sort_simulation_rows(rows)
-
-
-def inclusive_range(start, end, step):
-    values = list(range(start, end + 1, step))
-
-    if values[-1] != end:
-        values.append(end)
-
-    return values
-
-
-def annotate_neighbor_stability(rows):
-    for row in rows:
-        if row["_rank"] != 2:
-            continue
-
-        neighbors = []
-        row_new_qt = row["_new_qt_value"]
-
-        for candidate in rows:
-            if candidate is row:
-                continue
-
-            if abs(candidate["_qt_value"] - row["_qt_value"]) > 1:
-                continue
-
-            candidate_new_qt = candidate["_new_qt_value"]
-
-            if row_new_qt is None or candidate_new_qt is None:
-                if row_new_qt is not None or candidate_new_qt is not None:
-                    continue
-            elif abs(candidate_new_qt - row_new_qt) > 2:
-                continue
-
-            neighbors.append(candidate)
-
-        neighbor_success = sum(
-            candidate["_rank"] == 2
-            for candidate in neighbors
-        )
-        neighbor_total = len(neighbors)
-        stability_ratio = (
-            neighbor_success / neighbor_total
-            if neighbor_total
-            else 0
-        )
-
-        if neighbor_success >= 3 and stability_ratio >= 0.60:
-            stability_label = "높음"
-            stability_rank = 2
-        elif neighbor_success >= 1 and stability_ratio >= 0.35:
-            stability_label = "중간"
-            stability_rank = 1
-        else:
-            stability_label = "낮음"
-            stability_rank = 0
-
-        row["_neighbor_success"] = neighbor_success
-        row["_neighbor_total"] = neighbor_total
-        row["_stability_rank"] = stability_rank
-        row["인접 성공"] = (
-            f"{neighbor_success}/{neighbor_total}"
-            if neighbor_total
-            else "0/0"
-        )
-        row["추천 안정성"] = stability_label
-
+        forward, reverse = packet["reads"]
+        overlap = inspect_overlap(forward, reverse, condition.qt)
+        engine = run_phrap(packet, executable, options) if executable else None
+        rows.append({"condition": asdict(condition), "available": True,
+            "source": packet["input_source"], "lengths": [len(forward.sequence), len(reverse.sequence)],
+            "overlap": overlap, "label": overlap_label(overlap), "engine": engine,
+            "company_result": "미검증",
+        })
     return rows
 
 
-def simulate_condition_range(
-    forward_data,
-    reverse_data,
-    qt_min,
-    qt_max,
-    new_qt_min,
-    new_qt_max,
-    include_qt_only=True,
-    selected_condition=None,
-):
-    """
-    넓은 범위는 QT 2/New QT 5 단위로 먼저 검색하고, 상위 세
-    후보 주변을 QT 1/New QT 1 단위로 다시 계산합니다.
-    """
+def source_text(source):
+    return "시범 전처리 · 회사 규칙 미확인" if source == "preview_assumption" else "제공된 전처리 입력 · 사내 일치 미확인"
 
-    coarse_qt_values = set(inclusive_range(qt_min, qt_max, 2))
-    coarse_new_qt_values = set(
-        inclusive_range(new_qt_min, new_qt_max, 5)
-    )
 
-    for standard_qt, standard_new_qt in CONDITION_THRESHOLDS.values():
-        if qt_min <= standard_qt <= qt_max:
-            coarse_qt_values.add(standard_qt)
+def condition_table():
+    return pd.DataFrame([{
+        "조건": c.label, "QT": c.qt, "New QT": "사용" if c.new_qt_enabled else "미사용",
+        "Window size": str(c.window_size) if c.new_qt_enabled else "미적용", "2nd QT": "미사용",
+    } for c in CONDITIONS])
 
-        if (
-            standard_new_qt is not None
-            and new_qt_min <= standard_new_qt <= new_qt_max
-        ):
-            coarse_new_qt_values.add(standard_new_qt)
 
-    condition_specs = set()
+def summary_rows(rows):
+    records = []
+    for row in rows:
+        condition = row["condition"]
+        overlap = row.get("overlap") or {}
+        engine = row.get("engine") or {}
+        records.append({
+            "조건": condition["label"], "QT": condition["qt"],
+            "New QT 사용": condition["new_qt_enabled"], "Window size": condition["window_size"],
+            "2nd QT 사용": condition["second_qt_enabled"],
+            "입력": source_text(row["source"]) if row.get("available") else "없음",
+            "F 길이": row.get("lengths", [None, None])[0],
+            "R 길이": row.get("lengths", [None, None])[1],
+            "겹침 후보 bp": overlap.get("paired_bases"), "Gap 포함 일치율": overlap.get("gap_identity"),
+            "겹침 참고 평가": row["label"], "phrap 실행 결과": engine.get("label", "미실행"),
+            "phrap 버전": engine.get("version"), "회사 결과": "미검증",
+            "회사 실측 입력": "", "실측 입력 시각": "",
+        })
+    return records
 
-    for qt_value in sorted(coarse_qt_values):
-        if include_qt_only:
-            condition_specs.add((qt_value, None))
 
-        for current_new_qt in sorted(coarse_new_qt_values):
-            condition_specs.add((qt_value, current_new_qt))
+def comparison_note(rows):
+    executed = [row for row in rows if row.get("engine")]
+    if not executed:
+        return "phrap을 실행하지 않았습니다. 네 조건의 겹침 지표를 참고해 실제 결과를 확인해 주세요."
+    joined = [row["condition"]["label"] for row in executed if row["engine"]["state"] == "joined"]
+    if joined:
+        return "이번 입력으로 phrap 결합이 확인된 조건: " + ", ".join(joined) + ". 회사 처리 결과와의 일치는 별도 확인이 필요합니다."
+    return "이번 실행에서 F/R이 같은 contig에 속한 조건은 확인되지 않았습니다. 조건별 분리·오류·미출력 상태를 확인해 주세요."
 
-    if selected_condition in CONDITION_THRESHOLDS:
-        selected_values = CONDITION_THRESHOLDS[selected_condition]
-        condition_specs.add(selected_values)
 
-    rows_by_values = {}
-
-    def evaluate_specs(specs):
-        for qt_value, current_new_qt in sorted(
-            specs,
-            key=lambda spec: (
-                spec[0],
-                -1 if spec[1] is None else spec[1],
-            ),
-        ):
-            key = (qt_value, current_new_qt)
-
-            if key in rows_by_values:
+def export_bundle(packets, rows):
+    buffer = io.BytesIO()
+    manifest = {
+        "app_version": APP_VERSION, "target_phrap_version": TARGET_PHRAP_VERSION,
+        "company_trimming_verified": False, "conditions": {},
+    }
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for condition in CONDITIONS:
+            packet = packets.get(condition.label)
+            if packet is None:
                 continue
-
-            rows_by_values[key] = evaluate_condition_values(
-                forward_data,
-                reverse_data,
-                qt_value,
-                current_new_qt,
-            )
-
-    evaluate_specs(condition_specs)
-
-    coarse_rows = sort_simulation_rows(
-        list(rows_by_values.values())
-    )
-    seed_rows = coarse_rows[:3]
-    fine_specs = set()
-
-    for seed in seed_rows:
-        seed_qt = seed["_qt_value"]
-        seed_new_qt = seed["_new_qt_value"]
-
-        for qt_value in range(
-            max(qt_min, seed_qt - 1),
-            min(qt_max, seed_qt + 1) + 1,
-        ):
-            if seed_new_qt is None:
-                if include_qt_only:
-                    fine_specs.add((qt_value, None))
-                continue
-
-            for current_new_qt in range(
-                max(new_qt_min, seed_new_qt - 2),
-                min(new_qt_max, seed_new_qt + 2) + 1,
-            ):
-                fine_specs.add((qt_value, current_new_qt))
-
-    evaluate_specs(fine_specs)
-
-    rows = list(rows_by_values.values())
-    annotate_neighbor_stability(rows)
-    return sort_simulation_rows(rows)
-
-
-def choose_best_simulation(simulation_rows):
-    if not simulation_rows:
-        return None
-
-    return sort_simulation_rows(simulation_rows)[0]
-
-
-# --------------------------------------------------
-# Alignment 내용을 여러 줄로 출력
-# --------------------------------------------------
-def format_alignment_preview(
-    aligned_left,
-    markers,
-    aligned_right,
-    left_label="Left",
-    right_label="Right",
-    line_width=100,
-):
-    output_lines = []
-
-    total_length = len(aligned_left)
-
-    for start in range(
-        0,
-        total_length,
-        line_width,
-    ):
-        end = min(
-            start + line_width,
-            total_length,
-        )
-
-        output_lines.append(
-            f"{left_label:<20} " + aligned_left[start:end]
-        )
-
-        output_lines.append(
-            " " * 21 + markers[start:end]
-        )
-
-        output_lines.append(
-            f"{right_label:<20} " + aligned_right[start:end]
-        )
-
-        output_lines.append("")
-
-    return "\n".join(output_lines)
-
-# --------------------------------------------------
-# 메인 화면
-# --------------------------------------------------
-st.title("🧬 Contig QC Demo")
-
-st.write(
-    """
-    Forward와 Reverse AB1 파일의 염기서열과 Quality를 읽고,
-    원본 read를 유지한 채 Quality 가중 terminal overlap과
-    junction soft-clipping 가능성을 평가합니다. Primer명과 무관하게
-    16S, ITS, M13F/M13R처럼 서로 마주 보는 read 쌍을 사용할 수
-    있습니다.
-    """
-)
-
-st.divider()
-
-
-# --------------------------------------------------
-# 조건 설정
-# --------------------------------------------------
-st.subheader("조건 설정")
-
-st.caption(
-    "16·10·20은 New QT 미사용 조건입니다. 20/10·30/20처럼 "
-    "두 숫자를 표시한 조건은 QT/New QT를 의미합니다. "
-    "실측 사례를 바탕으로 overlap·Quality·junction을 함께 평가하며, "
-    "긴 overlap의 gap은 반대 read의 주변 품질도 확인합니다. "
-    "회사 프로그램의 trimming을 그대로 재현한 결과는 아니며, "
-    "새 샘플과 확장 조건의 결과는 실제 분석에서 확인해 주세요."
-)
-
-selected_condition = st.selectbox(
-    "현재 분석 조건",
-    options=COMPANY_CONDITIONS,
-    index=COMPANY_CONDITIONS.index("16"),
-)
-
-qt_threshold, new_qt_threshold = parse_company_condition(
-    selected_condition
-)
-
-with st.expander("조건 시뮬레이터 설정", expanded=False):
-    qt_search_range = st.slider(
-        "QT 탐색 범위",
-        min_value=10,
-        max_value=30,
-        value=(10, 30),
-        step=1,
-    )
-
-    new_qt_search_range = st.slider(
-        "New QT 탐색 범위",
-        min_value=10,
-        max_value=40,
-        value=(10, 40),
-        step=1,
-    )
-
-    include_qt_only = st.checkbox(
-        "New QT 미사용 조건도 탐색",
-        value=True,
-        help=(
-            "QT만 사용하는 16, 20 등의 조건을 숫자 0과 구분해 "
-            "별도 평가합니다."
-        ),
-    )
-
-    st.caption(
-        "지정 범위를 먼저 QT 2/New QT 5 단위로 탐색한 뒤 상위 "
-        "후보 주변을 1단위로 정밀 분석합니다. 표준 조건은 실제 "
-        "사례 보정값을 유지하고, 그 외 값은 확장 조건으로 "
-        "표시합니다. 확장 조건도 75 bp 미만의 짧은 overlap은 "
-        "성공으로 승격하지 않으며, 장거리 내부 overlap은 확인된 "
-        "구조 경계를 모두 통과해야 합니다. 선택한 현재 조건은 "
-        "범위 밖이어도 비교를 위해 "
-        "자동 포함합니다."
-    )
-
-st.divider()
-
-
-# --------------------------------------------------
-# 파일 업로드
-# --------------------------------------------------
-left_column, right_column = st.columns(2)
-
-with left_column:
-    st.subheader("Forward AB1")
-
-    forward_file = st.file_uploader(
-        "Forward 방향 AB1 파일을 선택하세요.",
-        type=["ab1", "abi"],
-        key="forward_file",
-    )
-
-with right_column:
-    st.subheader("Reverse AB1")
-
-    reverse_file = st.file_uploader(
-        "Reverse 방향 AB1 파일을 선택하세요.",
-        type=["ab1", "abi"],
-        key="reverse_file",
-    )
-
-st.divider()
-
-
-# --------------------------------------------------
-# 분석 실행
-# --------------------------------------------------
-if forward_file is not None and reverse_file is not None:
-
-    if st.button(
-        "AB1 파일 분석",
-        type="primary",
-        use_container_width=True,
-    ):
-
-        try:
-            # AB1 읽기
-            forward_data = read_ab1(forward_file)
-            reverse_data = read_ab1(reverse_file)
-
-            st.success(
-                "F/R AB1 파일을 정상적으로 읽었습니다."
-            )
-
-            # 원본 요약
-            summary_table = pd.DataFrame(
-                [
-                    make_summary(
-                        forward_data,
-                        "Forward",
-                    ),
-                    make_summary(
-                        reverse_data,
-                        "Reverse",
-                    ),
-                ]
-            )
-
-            st.subheader("AB1 원본 요약")
-
-            st.dataframe(
-                summary_table,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            st.divider()
-
-            # Quality 그래프
-            chart_left, chart_right = st.columns(2)
-
-            with chart_left:
-                show_quality_chart(
-                    forward_data,
-                    "Forward",
-                )
-
-            with chart_right:
-                show_quality_chart(
-                    reverse_data,
-                    "Reverse",
-                )
-
-            st.divider()
-
-            # 원본 Reverse read를 reverse-complement로 변환
-            (
-                reverse_complement_sequence,
-                reverse_complement_qualities,
-            ) = make_reverse_complement(
-                reverse_data["sequence"],
-                reverse_data["quality_scores"],
-            )
-
-            overlap_result = analyze_best_reverse_orientation(
-                forward_data["sequence"],
-                forward_data["quality_scores"],
-                reverse_data["sequence"],
-                reverse_data["quality_scores"],
-                qt_threshold,
-                new_qt_threshold,
-            )
-
-            current_prediction = classify_contig_prediction(
-                overlap_result,
-                qt_threshold,
-                new_qt_threshold,
-                selected_condition,
-            )
-
-            with st.expander(
-                "현재 조건 F/R terminal overlap 분석",
-                expanded=False,
-            ):
-                st.caption(
-                    f"현재 조건: {selected_condition}. "
-                    "원본 read를 유지하고 Reverse 원본/"
-                    "reverse-complement 및 두 연결 방향을 모두 "
-                    "평가했습니다."
-                )
-
-                if overlap_result is None:
-                    st.error(
-                        "F와 Reverse-complement R 사이에서 "
-                        "terminal overlap 후보를 찾지 못했습니다."
-                    )
-                else:
-                    overlap_table = pd.DataFrame(
-                        [
-                            {
-                                "Alignment score": overlap_result[
-                                    "score"
-                                ],
-                                "Overlap 염기 수": overlap_result[
-                                    "paired_bases"
-                                ],
-                                "Gap 제외 Identity (%)": overlap_result[
-                                    "base_identity"
-                                ],
-                                "Gap 포함 Identity (%)": overlap_result[
-                                    "gap_included_identity"
-                                ],
-                                "Quality 가중 Identity (%)": overlap_result[
-                                    "quality_weighted_identity"
-                                ],
-                                f"Q{qt_threshold} 지지 Match": overlap_result[
-                                    "qt_supported_matches"
-                                ],
-                                f"Q{qt_threshold} 최장 연속 Match": overlap_result[
-                                    "qt_supported_longest_match_run"
-                                ],
-                                "고품질 Mismatch/Gap": overlap_result[
-                                    "qt_supported_conflicts"
-                                ],
-                                "Match": overlap_result["matches"],
-                                "Mismatch": overlap_result["mismatches"],
-                                "Gap": overlap_result["gaps"],
-                                "최장 연속 Gap": overlap_result[
-                                    "longest_gap_run"
-                                ],
-                                "양측 QT 지지 최장 Gap": overlap_result[
-                                    "qt_bilateral_longest_gap_run"
-                                ],
-                                "양측 QT 지지 충돌": overlap_result[
-                                    "qt_bilateral_conflicts"
-                                ],
-                            }
-                        ]
-                    )
-
-                    st.dataframe(
-                        overlap_table,
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-                    prediction_message = (
-                        f"{current_prediction['status']}: "
-                        f"{current_prediction['reason']}"
-                    )
-
-                    if (
-                        current_prediction["status"]
-                        == "F+R 결합 성공 예상"
-                    ):
-                        st.success(prediction_message)
-                    elif (
-                        current_prediction["status"]
-                        == "Contig2 예상"
-                    ):
-                        st.warning(prediction_message)
-                    else:
-                        st.error(prediction_message)
-
-            if overlap_result is not None:
-                junction_table = pd.DataFrame(
-                    [
-                        {
-                            "연결 방향": overlap_result[
-                                "connection_direction"
-                            ],
-                            "Reverse 처리": overlap_result[
-                                "reverse_orientation"
-                            ],
-                            "왼쪽 junction soft-clip": overlap_result[
-                                "left_tail_unaligned"
-                            ],
-                            "오른쪽 junction soft-clip": overlap_result[
-                                "right_head_unaligned"
-                            ],
-                            "Soft-clip 합계": overlap_result[
-                                "terminal_slack_total"
-                            ],
-                            "경계 기준 이상 soft-clip 염기": overlap_result[
-                                "terminal_high_quality_bases"
-                            ],
-                            "Soft-clip 저품질 비율 (%)": round(
-                                overlap_result[
-                                    "terminal_low_quality_fraction"
-                                ]
-                                * 100,
-                                2,
-                            ),
-                            "Forward junction 인접 60 bp 평균 Q": (
-                                overlap_result[
-                                    "forward_junction_softclip_adjacent_mean_quality"
-                                ]
-                            ),
-                            "Reverse junction 인접 60 bp 평균 Q": (
-                                overlap_result[
-                                    "reverse_junction_softclip_adjacent_mean_quality"
-                                ]
-                            ),
-                        }
-                    ]
-                )
-
-                with st.expander(
-                    "Junction 경계 평가",
-                    expanded=False,
-                ):
-                    st.dataframe(
-                        junction_table,
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-                with st.expander("지표 설명", expanded=False):
-                    st.markdown(
-                        """
-- **Junction**은 방향을 맞춘 두 read가 contig로 이어지는 연결 경계입니다.
-- **왼쪽 junction soft-clip**은 왼쪽 read의 정렬 종료 뒤에 남아, 연결을 위해 제외해야 하는 말단 염기 수입니다.
-- **오른쪽 junction soft-clip**은 오른쪽 read의 정렬 시작 전에 남아, 연결을 위해 제외해야 하는 말단 염기 수입니다.
-- **Soft-clip 합계**는 위 두 값의 합입니다. 작을수록 두 read가 말단에서 직접 만나지만, 작다는 이유만으로 contig 성공이 확정되지는 않습니다.
-- **경계 기준 이상 soft-clip 염기**는 제외 후보 중 현재 품질 경계 이상인 염기 수입니다. New QT 사용 조건에서는 New QT, 미사용 조건에서는 QT가 경계가 됩니다. 값이 크면 신뢰도 높은 서열을 많이 버려야 하므로 불리합니다.
-- **Soft-clip 저품질 비율**은 제외 후보 중 현재 품질 경계 미만 염기의 비율입니다. 높을수록 말단 제외가 합리적이라는 보조 근거입니다.
-- **Junction 인접 60 bp 평균 Q**는 overlap 바로 바깥에서 제거해야 하는 구간의 평균 품질입니다. 어느 한쪽이라도 Q24를 넘으면 신뢰도 높은 염기를 잘라야 하므로, 장거리 내부 overlap을 성공으로 자동 승격하지 않습니다.
-- **QT 최장 연속 Match**는 양쪽 염기가 모두 현재 QT 이상이면서 정확히 일치하는 구간 중 가장 긴 연속 길이입니다. QT 지지 Match 총량이 많아도 이 값이 짧으면 고품질 anchor가 여러 조각으로 끊긴 상태입니다.
-- **최장 연속 Gap**은 정렬 중 한 번에 연속해서 끊긴 길이입니다. Gap 총량이 비슷해도 연속 Gap이 길면 연결부 단절 위험을 더 크게 봅니다. 특히 New QT 보정이 없는 QT16은 2 bp부터 Contig2 경계로 평가합니다.
-- **양측 QT 지지 최장 Gap**은 gap 염기와 반대 read에서 gap을 둘러싼 두 염기의 Quality가 모두 현재 QT 이상인 연속 길이입니다. 원본 gap을 삭제하거나 실제 InDel 여부를 확정하는 지표가 아닙니다.
-- **양측 QT 지지 충돌**은 위 기준을 통과한 gap 염기에 양측 QT 이상 mismatch·불명확 염기를 더한 값입니다. 긴 overlap의 20/10·30/20 보정에서는 이 값과 연속 anchor, junction 잔여를 함께 확인합니다.
-- **단독 QT20 저품질 말단 제거형**은 짧은 terminal overlap이라도 Identity와 Q20 anchor가 높고, junction 밖 말단이 모두 Q20 미만이며 gap이 짧게 분산된 경우입니다. 현재 확인된 실제 성공 구조에만 제한적으로 적용합니다.
-- **사전 정리된 비대칭 read형**은 한쪽 read가 짧고 평균 Quality가 높으며 반대쪽 read는 길지만 충분한 Q30 구간을 유지하는 구조입니다. overlap이 75 bp 미만이어도 전체 read와 junction 기준을 모두 통과하면 확인된 표준 조건에서 성공으로 평가합니다.
-- **양쪽 긴 read의 Q30 core형**은 낮은 QT에서 긴 저품질 tail이 남아 Contig2가 되지만, 양쪽 Q30 read-through가 충분하면 30/20에서만 짧은 overlap을 제한적으로 사용할 수 있는 구조입니다.
-- **장거리 내부 overlap**은 양쪽 read 끝에 긴 read-through가 남아도 내부에서 250 bp 이상의 강하고 연속적인 overlap이 확인되는 유형입니다. Primer명과 무관하게 평가하며, 일반 terminal overlap보다 엄격한 Identity·gap·anchor 기준을 적용합니다.
-                        """
-                    )
-                    st.info(
-                        "Soft-clip은 원본 AB1에서 염기를 삭제한다는 "
-                        "뜻이 아니라, 해당 alignment/조립 경계에서 "
-                        "사용하지 않는 후보 구간입니다. 이 지표들은 "
-                        "구조적 보조값이며 QT 조건별 성공을 단독으로 "
-                        "결정하지 않습니다."
-                    )
-
-                    st.caption(
-                        "Gap을 일률적으로 동일 감점하지 않고 해당 "
-                        "염기의 Quality로 가중했습니다. 정렬 밖 "
-                        "junction 염기도 현재 품질 경계 미만이면 저품질 "
-                        "soft-clip 후보로 취급합니다."
-                    )
-
-                with st.expander("Alignment 상세 보기", expanded=False):
-                    alignment_preview = format_alignment_preview(
-                        overlap_result["aligned_left"],
-                        overlap_result["markers"],
-                        overlap_result["aligned_right"],
-                        overlap_result["left_sequence"],
-                        overlap_result["right_sequence"],
-                    )
-
-                    st.code(
-                        alignment_preview,
-                        language=None,
-                    )
-
-            # ----------------------------------
-            # QT / New QT 범위 탐색
-            # ----------------------------------
-            with st.spinner(
-                "QT/New QT 범위를 탐색하고 상위 후보를 "
-                "정밀 분석하고 있습니다..."
-            ):
-                simulation_rows = simulate_condition_range(
-                    forward_data,
-                    reverse_data,
-                    qt_search_range[0],
-                    qt_search_range[1],
-                    new_qt_search_range[0],
-                    new_qt_search_range[1],
-                    include_qt_only=include_qt_only,
-                    selected_condition=selected_condition,
-                )
-
-            best_simulation = choose_best_simulation(
-                simulation_rows
-            )
-
-            st.divider()
-            st.subheader("Contig 시뮬레이션 결과")
-            st.caption(
-                "지정 범위에서 성공 가능 조건을 찾고, 인접 QT/New "
-                "QT에서도 결과가 유지되는지 평가합니다. 표준 조건은 "
-                "확인된 AB1 쌍의 실제 결과로 보정했으며, 확장 "
-                "조건은 구조 기반 탐색 후보입니다."
-            )
-
-            simulation_display_rows = [
-                {
-                    key: value
-                    for key, value in row.items()
-                    if not key.startswith("_")
-                }
-                for row in simulation_rows
+            for name in ("fasta", "qual"):
+                filename = "reads.fasta" if name == "fasta" else "reads.fasta.qual"
+                archive.writestr(f"{condition.key}/{filename}", packet[name])
+            manifest["conditions"][condition.label] = {
+                key: packet[key] for key in ("condition", "input_source", "trim_metadata", "fasta_sha256", "qual_sha256")
+            }
+            manifest["conditions"][condition.label]["original_reads"] = [
+                {"name": r.name, "file_name": r.file_name, "source_sha256": r.source_sha256}
+                for r in packet["reads"]
             ]
+        for row in rows:
+            engine = row.get("engine")
+            if not engine:
+                continue
+            prefix = row["condition"]["label"].replace("/", "_") + "/phrap_output/"
+            for filename, data in engine.get("files", {}).items():
+                archive.writestr(prefix + filename, data)
+            archive.writestr(prefix + "console.txt", engine.get("log", ""))
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        archive.writestr("analysis.json", json.dumps(rows, ensure_ascii=False, indent=2))
+        archive.writestr("comparison.csv", pd.DataFrame(summary_rows(rows)).to_csv(index=False).encode("utf-8-sig"))
+        archive.writestr("README.txt", (
+            "QT/Window 비교 자료\n\n"
+            "20/10 = QT20, New QT 사용, Window size10. 30/20 = QT30, New QT 사용, Window size20.\n"
+            "단독 표기 16과 10은 New QT 미사용이며 모든 조건에서 2nd QT를 사용하지 않습니다.\n"
+            "preview_assumption 입력은 시범 trimming 결과입니다. 회사 전처리와 동일하다고 간주하지 마세요.\n"
+            "provided_unverified 입력은 업로드된 FASTA/QUAL bytes를 그대로 사용한 결과입니다.\n"
+            "회사 실측은 comparison.csv의 빈 칸에 입력합니다. 자동 예측이나 학습값으로 채우지 않습니다.\n"
+            "재분석: 이 ZIP을 '전처리 입력 ZIP'으로 업로드할 수 있습니다.\n"
+            "사내 입력은 조건 폴더(16,20_10,30_20,10)의 reads.fasta 및 reads.fasta.qual로 넣습니다.\n"
+            "각 입력에는 F/R 두 read를 같은 ID/순서로 넣고, 각 read의 서열/Quality 길이를 맞춥니다.\n"
+            "원본 입력 방향은 phrap에 그대로 전달합니다. 참고 정렬에서만 R 방향을 비교합니다.\n"
+            "phrap 결과는 이 입력과 기록된 옵션에서 실제 실행한 결과이며 회사 결과의 재현을 보증하지 않습니다.\n"
+        ))
+    return buffer.getvalue()
 
-            simulation_table = pd.DataFrame(
-                simulation_display_rows
-            )
 
-            if best_simulation is not None:
-                recommendation = (
-                    f"추천 조건: {best_simulation['조건']} · "
-                    f"{best_simulation['조건 유형']} 조건 · "
-                    f"{best_simulation['Contig 예측']} · "
-                    f"안정성 {best_simulation['추천 안정성']} "
-                    f"(인접 성공 {best_simulation['인접 성공']}) · "
-                    f"{best_simulation['판정 근거']}"
-                )
+def alignment_preview(overlap, width=90):
+    lines = []
+    for start in range(0, len(overlap["markers"]), width):
+        end = start + width
+        lines.extend(["F  " + overlap["aligned_f"][start:end],
+                      "   " + overlap["markers"][start:end],
+                      "R  " + overlap["aligned_r"][start:end], ""])
+    return "\n".join(lines)
 
-                if (
-                    best_simulation["Contig 예측"]
-                    == "F+R 결합 성공 예상"
-                ):
-                    if best_simulation["조건 유형"] == "확장":
-                        st.info(
-                            recommendation
-                            + " · 확장 조건은 아직 실제 결과 보정이 "
-                            "없으므로 시험 적용 후보입니다."
-                        )
-                    elif best_simulation["추천 안정성"] == "낮음":
-                        st.warning(
-                            recommendation
-                            + " · 단일 조건 성공일 수 있어 실제 적용 전 "
-                            "검토가 필요합니다."
-                        )
-                    else:
-                        st.success(recommendation)
-                elif best_simulation["Contig 예측"] == "Contig2 예상":
-                    st.warning(recommendation)
+
+def quality_summary(reads):
+    return pd.DataFrame([{
+        "Read": r.name, "파일": r.file_name, "길이": len(r.sequence),
+        "평균 Q": round(sum(r.qualities) / len(r.qualities), 2) if r.qualities else 0,
+        "Q20 이상 bp": sum(q >= 20 for q in r.qualities),
+        "Q30 이상 bp": sum(q >= 30 for q in r.qualities),
+    } for r in reads])
+
+
+def render_result(rows, packets):
+    st.subheader("네 조건 비교")
+    st.info(comparison_note(rows))
+    if any(row.get("source") == "preview_assumption" for row in rows):
+        st.caption("아래 길이와 겹침은 선택한 시범 전처리 방식의 결과입니다. 회사의 Contig/Contig2 예측으로 표시하지 않습니다.")
+    # 가로 드래그 없이 네 조건을 확인한다. 결과가 없거나 오류인 조건도 숨기지 않는다.
+    for start in (0, 2):
+        columns = st.columns(2)
+        for column, row in zip(columns, rows[start:start+2]):
+            with column, st.container(border=True):
+                condition = row["condition"]
+                st.markdown(f"### {condition['label']}")
+                window = str(condition["window_size"]) if condition["new_qt_enabled"] else "미적용"
+                new_label = "사용" if condition["new_qt_enabled"] else "미사용"
+                st.caption(f"QT {condition['qt']} · New QT {new_label} · Window {window} · 2nd QT 미사용")
+                if not row["available"]:
+                    st.write(row["label"])
+                    continue
+                st.write(f"분석 입력 길이: F **{row['lengths'][0]} bp** / R **{row['lengths'][1]} bp**")
+                overlap = row["overlap"]
+                if overlap:
+                    st.write(f"겹침 후보 **{overlap['paired_bases']} bp** · Gap 포함 일치율 **{overlap['gap_identity']:.2f}%**")
+                st.write(f"참고 평가: {row['label']}")
+                engine = row["engine"]
+                if not engine:
+                    st.caption("phrap 미실행 · 회사 결과 미검증")
                 else:
-                    st.error(
-                        "시험한 조건에서 생성 가능한 조합을 "
-                        "찾지 못했습니다. "
-                        + recommendation
-                    )
+                    message = "phrap 실행: " + engine["label"]
+                    if engine["state"] == "joined":
+                        st.success(message)
+                    elif engine["state"] in {"error", "unreadable"}:
+                        st.error(message)
+                    else:
+                        st.warning(message)
+                    if not engine["version_matches"]:
+                        st.warning(f"실행 버전: {engine.get('version') or '미확인'} · 목표 버전 0.990319와 일치 확인 필요")
+                    st.caption(source_text(row["source"]) + " · 회사 결과 미검증")
 
-            success_count = sum(
-                row["Contig 예측"] == "F+R 결합 성공 예상"
-                for row in simulation_rows
-            )
-            contig2_count = sum(
-                row["Contig 예측"] == "Contig2 예상"
-                for row in simulation_rows
-            )
-            no_contig_count = sum(
-                row["Contig 예측"] == "No contig 예상"
-                for row in simulation_rows
-            )
-
-            summary_success, summary_contig2, summary_fail = st.columns(3)
-            summary_success.metric(
-                "결합 성공 예상",
-                f"{success_count}개 조건",
-            )
-            summary_contig2.metric(
-                "Contig2 예상",
-                f"{contig2_count}개 조건",
-            )
-            summary_fail.metric(
-                "No contig 예상",
-                f"{no_contig_count}개 조건",
-            )
-
-            st.markdown("#### 추천 후보 상위 조건")
-
-            top_card_rows = simulation_rows[:12]
-
-            for batch_start in range(0, len(top_card_rows), 4):
-                card_rows = top_card_rows[
-                    batch_start:batch_start + 4
-                ]
-                card_columns = st.columns(len(card_rows))
-
-                for card_column, row in zip(
-                    card_columns,
-                    card_rows,
-                ):
-                    with card_column:
-                        with st.container(border=True):
-                            st.markdown(
-                                f"### QT {row['조건']}"
-                            )
-                            st.caption(
-                                f"{row['조건 유형']} 조건 · "
-                                f"안정성 {row['추천 안정성']} · "
-                                f"인접 성공 {row['인접 성공']}"
-                            )
-
-                            if (
-                                row["Contig 예측"]
-                                == "F+R 결합 성공 예상"
-                            ):
-                                st.success("✅ F+R 결합 성공 예상")
-                            elif row["Contig 예측"] == "Contig2 예상":
-                                st.warning("⚠️ Contig2 예상")
-                            else:
-                                st.error("❌ No contig 예상")
-
-                            metric_left, metric_right = st.columns(2)
-                            metric_left.metric(
-                                "Overlap",
-                                f"{row['Overlap']} bp",
-                            )
-                            metric_right.metric(
-                                "가중 Identity",
-                                (
-                                    f"{row['Quality 가중 Identity (%)']}%"
-                                ),
-                            )
-
-                            st.caption(
-                                "QT 연속 Match "
-                                f"{row['QT 최장 연속 Match']} bp"
-                            )
-                            st.caption(row["판정 근거"])
-
-            with st.expander("상세 수치 표 보기"):
-                st.dataframe(
-                    simulation_table,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-            simulation_csv = simulation_table.to_csv(
-                index=False
-            ).encode("utf-8-sig")
-
-            st.download_button(
-                "시뮬레이션 결과 CSV 다운로드",
-                data=simulation_csv,
-                file_name="contig_simulation_results.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-
-            # ----------------------------------
-            # 재반응 방향 및 기대 효과
-            # ----------------------------------
-            rerun_assessment = evaluate_rerun_scenarios(
-                forward_data,
-                reverse_data,
-                overlap_result,
-                current_prediction,
-                simulation_rows,
-                selected_condition,
-                qt_threshold,
-            )
-
-            st.divider()
-            st.subheader("재반응 시나리오")
-            st.caption(
-                "선택한 현재 조건과 전체 Contig 시뮬레이션 결과를 "
-                "함께 평가합니다. 각 단계는 재반응의 상대적 기대 "
-                "효과이며, 실제 성공 확률을 의미하지 않습니다."
-            )
-
-            recommendation_text = (
-                f"추천: {rerun_assessment['recommendation']} · "
-                f"판단 신뢰도 {rerun_assessment['confidence']} · "
-                f"{rerun_assessment['recommendation_reason']}"
-            )
-
-            if rerun_assessment["recommendation"] == "재반응 불필요":
-                st.success(recommendation_text)
-            elif "조건" in rerun_assessment["recommendation"]:
-                st.info(recommendation_text)
-            elif "효과 낮음" in rerun_assessment["recommendation"]:
-                st.error(recommendation_text)
+    with st.expander("전처리 구간·정렬 상세", expanded=False):
+        selected = st.selectbox("상세 조건", [c.label for c in CONDITIONS], key="details_condition")
+        packet = packets.get(selected)
+        row = next(r for r in rows if r["condition"]["label"] == selected)
+        if packet:
+            st.caption(source_text(packet["input_source"]))
+            if packet["trim_metadata"]:
+                st.dataframe(pd.DataFrame(packet["trim_metadata"]), hide_index=True, use_container_width=True)
             else:
-                st.warning(recommendation_text)
+                st.caption("제공된 전처리 서열을 그대로 사용했습니다. 원본 AB1 내 절단 좌표는 알 수 없습니다.")
+            overlap = row.get("overlap")
+            if overlap:
+                st.write(f"R 처리: {overlap['reverse_orientation']} · 연결 방향: {overlap['connection']}")
+                st.write(f"Gap {overlap['gaps']} bp / 최장 연속 Gap {overlap['longest_gap']} bp / "
+                         f"QT 이상 일치 {overlap['qt_matches']} bp / QT 이상 충돌 {overlap['qt_conflicts']}개")
+                st.write(f"정렬 밖 연결 경계 잔여: {overlap['junction_unaligned']} bp")
+                st.code(alignment_preview(overlap), language=None)
+            engine = row.get("engine")
+            if engine:
+                st.write("실행 인수", engine.get("command", []))
+                st.code(engine.get("log", ""), language=None)
+        else:
+            st.info("해당 조건의 입력이 없습니다.")
 
-            scenario_columns = st.columns(4)
+    st.subheader("재반응 검토")
+    st.write("재반응 성공 확률은 계산하지 않습니다. 조건별로 남은 길이, 겹침 위치와 원본 파형을 함께 확인해 주세요.")
+    st.caption("겹침 후보가 짧거나 내부 불일치가 많으면 F/R 파형을 우선 확인합니다. 참고 정렬의 gap만으로 실제 InDel 또는 혼합을 확정할 수 없습니다.")
+    st.download_button("비교 결과와 phrap 입력 받기", export_bundle(packets, rows),
+        file_name="contig_QT_window_comparison.zip", mime="application/zip", key="result_download")
 
-            for scenario_column, scenario in zip(
-                scenario_columns,
-                rerun_assessment["scenarios"],
-            ):
-                with scenario_column:
-                    with st.container(border=True):
-                        st.markdown(f"#### {scenario['name']}")
 
-                        if scenario["kind"] == "risk":
-                            if scenario["level"] == "높음":
-                                st.error("🔴 높음")
-                            elif scenario["level"] == "중간":
-                                st.warning("🟠 중간")
-                            else:
-                                st.success("🟢 낮음")
-                        else:
-                            if scenario["level"] == "높음":
-                                st.success("🟢 높음")
-                            elif scenario["level"] == "중간":
-                                st.warning("🟠 중간")
-                            else:
-                                st.info("⚪ 낮음")
+def main():
+    st.set_page_config(page_title="Contig 조건 비교", page_icon="🧬", layout="wide")
+    st.title("🧬 Contig 조건 비교")
+    st.write("QT와 Window size를 구분해 네 조건을 비교합니다. 실제 phrap 결과는 실행했을 때만 표시합니다.")
+    st.caption(f"{APP_VERSION} · 대상 엔진 phrap {TARGET_PHRAP_VERSION}")
+    st.subheader("조건 설정")
+    st.dataframe(condition_table(), hide_index=True, use_container_width=True)
+    st.caption("20/10의 10과 30/20의 20은 Window size입니다. 16·10은 New QT 미사용이며 2nd QT는 네 조건 모두 미사용입니다.")
 
-                        st.caption(scenario["reason"])
-
-            with st.expander(
-                "재반응 판단 근거 상세 보기",
-                expanded=False,
-            ):
-                forward_profile = rerun_assessment[
-                    "forward_profile"
-                ]
-                reverse_profile = rerun_assessment[
-                    "reverse_profile"
-                ]
-                structural_support = rerun_assessment[
-                    "structural_support"
-                ]
-
-                evidence_table = pd.DataFrame(
-                    [
-                        {
-                            "방향": "Forward",
-                            "재반응 필요도": forward_profile[
-                                "need_level"
-                            ],
-                            "평균 Quality": forward_profile[
-                                "average_quality"
-                            ],
-                            "Q20 비율 (%)": round(
-                                forward_profile["q20_fraction"] * 100,
-                                2,
-                            ),
-                            "Q30 비율 (%)": round(
-                                forward_profile["q30_fraction"] * 100,
-                                2,
-                            ),
-                            "Q20 read-through": forward_profile[
-                                "readthrough_length"
-                            ],
-                            "Junction anchor 평균 Q": forward_profile[
-                                "junction_anchor_mean_quality"
-                            ],
-                            "저품질 junction soft-clip": forward_profile[
-                                "junction_low_quality_softclip"
-                            ],
-                        },
-                        {
-                            "방향": "Reverse",
-                            "재반응 필요도": reverse_profile[
-                                "need_level"
-                            ],
-                            "평균 Quality": reverse_profile[
-                                "average_quality"
-                            ],
-                            "Q20 비율 (%)": round(
-                                reverse_profile["q20_fraction"] * 100,
-                                2,
-                            ),
-                            "Q30 비율 (%)": round(
-                                reverse_profile["q30_fraction"] * 100,
-                                2,
-                            ),
-                            "Q20 read-through": reverse_profile[
-                                "readthrough_length"
-                            ],
-                            "Junction anchor 평균 Q": reverse_profile[
-                                "junction_anchor_mean_quality"
-                            ],
-                            "저품질 junction soft-clip": reverse_profile[
-                                "junction_low_quality_softclip"
-                            ],
-                        },
-                    ]
-                )
-
-                st.dataframe(
-                    evidence_table,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-                st.info(
-                    "Overlap 구조 지지: "
-                    f"{structural_support['level']} · "
-                    f"{structural_support['reason']}"
-                )
-                st.caption(
-                    "F/R 방향은 파일명이나 primer 표기가 아니라 "
-                    "Forward/Reverse 업로드 슬롯을 기준으로 표시합니다. "
-                    "한쪽 재반응 후 실제 결과 사례가 누적되면 이 "
-                    "규칙을 추가 보정할 수 있습니다."
-                )
-
-            st.divider()
-            # 서열 확인
-            with st.expander("Forward 원본 서열"):
-                st.text_area(
-                    "Forward original sequence",
-                    value=forward_data["sequence"],
-                    height=180,
-                    key="forward_original_sequence",
-                )
-
-            with st.expander("Reverse 원본 방향 서열"):
-                st.text_area(
-                    "Reverse original sequence",
-                    value=reverse_data["sequence"],
-                    height=180,
-                    key="reverse_original_sequence",
-                )
-
-            with st.expander("Reverse-complement 서열"):
-                st.text_area(
-                    "Reverse-complement sequence",
-                    value=reverse_complement_sequence,
-                    height=180,
-                    key="reverse_complement_sequence",
-                )
-
-        except Exception as error:
-            st.error(
-                "AB1 파일을 분석하는 과정에서 오류가 발생했습니다."
+    mode = st.radio("입력 종류", ("AB1 참고 분석", "전처리 입력 ZIP"), horizontal=True, key="input_mode")
+    method = "mean_q"
+    f_upload = r_upload = zip_upload = None
+    if mode == "AB1 참고 분석":
+        left, right = st.columns(2)
+        with left:
+            f_upload = st.file_uploader("Forward AB1", type=["ab1", "abi"], key="forward_file")
+        with right:
+            r_upload = st.file_uploader("Reverse AB1", type=["ab1", "abi"], key="reverse_file")
+        st.info("사내 trimming 규칙이 아직 확인되지 않았습니다. AB1 참고 분석은 아래에 명시한 시범 규칙을 사용합니다.")
+        with st.expander("시범 전처리 방식과 적용 범위", expanded=False):
+            method = st.selectbox("Window 계산 방식", list(PREVIEW_METHODS),
+                format_func=PREVIEW_METHODS.get, key="preview_method")
+            st.markdown(
+                "- **New QT 사용:** 지정한 Window size의 구간을 1 bp씩 이동하며 평가합니다.\n"
+                "- **New QT 미사용:** 시범 계산에서는 각 염기의 Q로 양 끝 경계를 찾습니다.\n"
+                "- 처음 통과한 구간부터 마지막 통과 구간까지 유지하며, 내부 저품질 염기를 삭제하지 않습니다.\n"
+                "- 평균 Quality는 Q의 산술평균, 평균 오류확률은 평균 `10^(-Q/10)`을 QT의 오류확률과 비교합니다.\n"
+                "- 두 방식 모두 회사 구현으로 확인된 방식이 아닙니다. Window size를 품질 임계값으로 사용하지 않습니다."
             )
-            st.exception(error)
+    else:
+        zip_upload = st.file_uploader("조건별 FASTA + QUAL ZIP", type=["zip"], key="processed_zip")
+        st.caption("제공된 서열과 Quality를 추가 trimming 없이 그대로 분석·실행합니다. 각 조건은 F/R 두 read를 같은 ID와 순서로 포함해야 합니다.")
+        with st.expander("입력 ZIP 구성", expanded=False):
+            st.write("조건 폴더명: 16, 20_10, 30_20, 10. 각 폴더에 reads.fasta와 reads.fasta.qual을 넣어 주세요. 일부 조건만 넣어도 비교할 수 있습니다.")
+            st.write("이 앱에서 내려받은 비교 ZIP도 다시 불러올 수 있습니다. 시범 전처리 자료는 재업로드해도 시범 자료로 표시됩니다.")
 
-else:
-    st.info(
-        "Forward와 Reverse AB1 파일을 모두 업로드해주세요."
+    with st.expander("phrap 실행 연결", expanded=False):
+        execute = st.checkbox("분석할 때 phrap도 실제 실행", value=False, key="run_phrap")
+        executable = st.text_input("phrap 실행 파일 경로", value=os.environ.get("PHRAP_EXECUTABLE", "phrap"), key="phrap_path")
+        options = st.text_input("회사에서 사용하는 추가 실행 옵션", value="", key="phrap_options")
+        st.caption("실행 파일은 이 Streamlit 앱이 돌아가는 컴퓨터에 있어야 합니다. -new_ace는 결과 판독을 위해 자동 추가합니다. 옵션이 비어 있으면 해당 실행 파일의 기본값을 사용합니다.")
+        st.caption("시범 전처리 입력으로 phrap을 실행해도 회사 결과가 재현됐다는 뜻은 아닙니다. 동일한 입력·버전·옵션을 먼저 확인해야 합니다.")
+
+    ready = (f_upload is not None and r_upload is not None) if mode == "AB1 참고 분석" else zip_upload is not None
+    upload_bytes = (
+        [f_upload.getvalue(), r_upload.getvalue()] if ready and mode == "AB1 참고 분석"
+        else [zip_upload.getvalue()] if ready else []
     )
+    fingerprint = sha256(json.dumps({"mode": mode, "method": method, "execute": execute,
+        "executable": executable, "options": options, "hashes": [sha256(x) for x in upload_bytes]}, sort_keys=True).encode())
+    clicked = st.button("네 조건 분석", type="primary", disabled=not ready, key="analyze_button")
+    if clicked:
+        st.session_state.pop("comparison_result", None)
+        try:
+            with st.spinner("네 조건의 입력과 겹침을 분석하고 있습니다…"):
+                reads = None
+                if mode == "AB1 참고 분석":
+                    reads = (read_ab1(upload_bytes[0], f_upload.name, "F"),
+                             read_ab1(upload_bytes[1], r_upload.name, "R"))
+                    packets = prepare_preview(reads, method)
+                else:
+                    packets = load_input_zip(upload_bytes[0])
+                rows = analyze_packets(packets, executable if execute else None, options)
+                st.session_state["comparison_result"] = (fingerprint, reads, packets, rows)
+        except (ValueError, OSError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+            st.error(str(exc))
+    result = st.session_state.get("comparison_result")
+    if result:
+        saved_fingerprint, reads, packets, rows = result
+        if saved_fingerprint != fingerprint:
+            st.info("입력 또는 설정이 바뀌었습니다. 네 조건 분석을 다시 실행해 주세요.")
+            return
+        if reads:
+            with st.expander("AB1 원본 Quality", expanded=False):
+                st.dataframe(quality_summary(reads), hide_index=True, use_container_width=True)
+                for column, read in zip(st.columns(2), reads):
+                    with column:
+                        st.caption(read.file_name)
+                        frame = pd.DataFrame({"염기 위치": range(1, len(read.qualities)+1), "Quality": read.qualities})
+                        st.line_chart(frame.set_index("염기 위치"))
+        render_result(rows, packets)
+
+
+if __name__ == "__main__":
+    main()
