@@ -6,6 +6,7 @@ from Bio import SeqIO
 from Bio.Seq import Seq
 from Bio.Align import PairwiseAligner
 
+APP_VERSION = "2026.09.23"
 
 # --------------------------------------------------
 # 페이지 설정
@@ -155,6 +156,64 @@ def normalize_quality_scores(sequence, qualities):
     return normalized
 
 
+def summarize_bilateral_gap_support(
+    indices,
+    left_qualities,
+    right_qualities,
+    left_window_start,
+    qt_threshold,
+):
+    """Gap 염기와 반대 read의 양쪽 인접 염기가 모두 QT 이상인지 평가.
+
+    한 read의 높은 Q만으로 gap을 고품질 충돌로 확정하지 않습니다.
+    Gap 블록을 둘러싼 반대 read의 두 Q 중 작은 값을 상한으로 쓰며,
+    양쪽 flank가 없으면 지지 근거를 0으로 둡니다. 기존 gap 지표는
+    그대로 유지하고, 이 보조 지표만 별도로 반환합니다.
+    """
+    positions = list(zip(indices[0], indices[1]))
+    qualities = (left_qualities[left_window_start:], right_qualities)
+    supported_bases = longest_run = 0
+    column = 0
+    while column < len(positions):
+        left_index, right_index = positions[column]
+        if left_index >= 0 and right_index >= 0:
+            column += 1
+            continue
+        gap_axis = 0 if left_index < 0 else 1
+        base_axis = 1 - gap_axis
+        end = column + 1
+        while end < len(positions) and positions[end][gap_axis] < 0:
+            end += 1
+        flank_qualities = []
+        for start, step in ((column - 1, -1), (end, 1)):
+            position = start
+            while (
+                0 <= position < len(positions)
+                and positions[position][gap_axis] < 0
+            ):
+                position += step
+            if 0 <= position < len(positions):
+                flank_qualities.append(
+                    qualities[gap_axis][int(positions[position][gap_axis])]
+                )
+        opposite_quality = (
+            min(flank_qualities) if len(flank_qualities) == 2 else 0
+        )
+        current_run = 0
+        for position in range(column, end):
+            own_quality = qualities[base_axis][
+                int(positions[position][base_axis])
+            ]
+            if min(own_quality, opposite_quality) >= qt_threshold:
+                supported_bases += 1
+                current_run += 1
+                longest_run = max(longest_run, current_run)
+            else:
+                current_run = 0
+        column = end
+    return supported_bases, longest_run
+
+
 def build_terminal_candidate(
     left_sequence,
     left_qualities,
@@ -214,6 +273,12 @@ def build_terminal_candidate(
     aligned_left = str(alignment[0])
     aligned_right = str(alignment[1])
     indices = alignment.indices
+    bilateral_gap_bases, bilateral_longest_gap_run = (
+        summarize_bilateral_gap_support(
+            indices, left_qualities, right_qualities,
+            left_window_start, qt_threshold,
+        )
+    )
 
     markers = []
     matches = 0
@@ -539,6 +604,13 @@ def build_terminal_candidate(
         "qt_supported_gaps": qt_supported_gaps,
         "qt_supported_ambiguous": qt_supported_ambiguous,
         "qt_supported_conflicts": qt_supported_conflicts,
+        "qt_bilateral_gap_bases": bilateral_gap_bases,
+        "qt_bilateral_longest_gap_run": bilateral_longest_gap_run,
+        "qt_bilateral_conflicts": (
+            bilateral_gap_bases
+            + qt_supported_mismatches
+            + qt_supported_ambiguous
+        ),
         "forward_start": forward_start,
         "forward_end": forward_end,
         "reverse_start": reverse_start,
@@ -894,6 +966,19 @@ MIN_LONG_GAPPED_30_20_GAP_IDENTITY = 85
 MAX_LONG_GAPPED_30_20_TERMINAL_SLACK = 50
 MAX_LONG_GAPPED_30_20_GAP_RUN = 2
 
+# 2026-09-23 NS1/NS24 4쌍의 실측 보정. 원본 gap 길이와 함께
+# 반대 read의 양쪽 flank까지 QT 이상인 gap의 연속성을 평가합니다.
+# 이는 경험적 예측 경계이며 실제 회사 프로그램의 QT trimming을
+# 재현하거나 독립 검증된 정확도를 의미하지 않습니다.
+# 실측 해석: I-260877/260895/260899/260901 모두 QT16·QT10 Contig2;
+# 20/10은 260877·260899 성공, 30/20은 260895만 Contig2.
+# 사용자 표기 20877/20899/26085는 위 첨부 파일명으로 해석했습니다.
+MIN_BILATERAL_RESCUE_OVERLAP = 250
+MIN_BILATERAL_RESCUE_WEIGHTED_IDENTITY = 92
+MAX_BILATERAL_RESCUE_GAP_RUN = 1
+MAX_BILATERAL_RESCUE_CONFLICT_FRACTION = 0.10
+MAX_QT10_LONG_ANCHOR_GAP_RUN = 3
+
 # 긴 내부 overlap 양쪽의 read-through가 대부분 New QT 미만이면
 # 제거 가능한 말단으로 볼 수 있습니다. TTO 변형 사례처럼 저품질
 # 비율이 78~80% 경계이면 gap 포함 Identity까지 함께 확인합니다.
@@ -1221,6 +1306,90 @@ def deep_internal_contig2_candidate(
     return low_qt_anchor_boundary or high_qt_internal_boundary
 
 
+def has_long_gapped_terminal_evidence(overlap_result):
+    """충분히 긴 terminal overlap에 gap이 많은 구조로 범위를 제한합니다.
+
+    짧은 overlap 및 M13 장거리 내부 overlap의 기존 보정을 분리합니다.
+    """
+    if not overlap_result:
+        return False
+    return (
+        overlap_result.get("reverse_orientation") == "Reverse-complement 적용"
+        and overlap_result["paired_bases"] >= MIN_BILATERAL_RESCUE_OVERLAP
+        and overlap_result["base_identity"] >= 97
+        and overlap_result["gap_included_identity"] >= 80
+        and overlap_result["quality_weighted_identity"] >= 90
+        and 8 <= overlap_result["gap_rate"] <= 20
+        and overlap_result["terminal_slack_total"] <= 60
+    )
+
+
+def bilateral_terminal_rescue_mode(overlap_result, qt_threshold, new_qt_threshold):
+    """양쪽 품질이 지지하는 gap과 QT 연속 anchor를 함께 평가합니다."""
+    if (
+        new_qt_threshold is None
+        or not has_long_gapped_terminal_evidence(overlap_result)
+        or "qt_bilateral_longest_gap_run" not in overlap_result
+    ):
+        return None
+    matches = overlap_result["qt_supported_matches"]
+    conflicts = overlap_result["qt_bilateral_conflicts"]
+    longest_match = overlap_result["qt_supported_longest_match_run"]
+    if (
+        overlap_result["quality_weighted_identity"]
+        < MIN_BILATERAL_RESCUE_WEIGHTED_IDENTITY
+        or overlap_result["qt_bilateral_longest_gap_run"]
+        > MAX_BILATERAL_RESCUE_GAP_RUN
+        or conflicts > matches * MAX_BILATERAL_RESCUE_CONFLICT_FRACTION
+    ):
+        return None
+    if (
+        20 <= qt_threshold < 25
+        and 10 <= new_qt_threshold <= 12
+        and matches >= 100
+        and longest_match >= 10
+        and overlap_result["terminal_high_quality_bases"] <= 40
+    ):
+        return "양측 품질을 반영한 긴 terminal overlap"
+    terminal_pass = (
+        overlap_result["terminal_high_quality_bases"] <= 30
+        and (
+            overlap_result["terminal_slack_total"] <= 20
+            or overlap_result["terminal_low_quality_fraction"] >= 0.65
+        )
+    )
+    # Q30 연속 anchor가 6~7 bp뿐이면 junction 잔여가 10 bp 이하인
+    # 경우에 한해 새 보정을 허용합니다. C_NS의 31 bp 잔여/7 bp
+    # anchor 구조를 성공으로 승격하지 않습니다.
+    anchor_pass = (
+        longest_match >= 8
+        or (longest_match >= 6 and overlap_result["terminal_slack_total"] <= 10)
+    )
+    if (
+        25 <= qt_threshold <= 30
+        and 15 <= new_qt_threshold <= 25
+        and matches >= 80
+        and anchor_pass
+        and terminal_pass
+    ):
+        return "고QT 양측 품질·junction 보정"
+    return None
+
+
+def bilateral_rescue_prediction(overlap_result, mode, qt_threshold):
+    return {
+        "status": "F+R 결합 성공 예상",
+        "rank": 2,
+        "reason": (
+            f"{mode}; overlap {overlap_result['paired_bases']} bp, "
+            f"원본 최장 gap {overlap_result['longest_gap_run']} bp, "
+            f"양측 Q{qt_threshold} 지지 최장 gap "
+            f"{overlap_result['qt_bilateral_longest_gap_run']} bp, "
+            f"양측 품질 지지 충돌 {overlap_result['qt_bilateral_conflicts']}개"
+        ),
+    }
+
+
 # --------------------------------------------------
 # Contig 생성 결과 판정
 # --------------------------------------------------
@@ -1352,6 +1521,12 @@ def classify_contig_prediction(
                 f"보정 사례에서 조건 {condition_label}은 No contig"
             ),
         }
+
+    bilateral_mode = bilateral_terminal_rescue_mode(
+        overlap_result, qt_threshold, new_qt_threshold,
+    )
+    if bilateral_mode is not None and condition_label in {"20/10", "30/20"}:
+        return bilateral_rescue_prediction(overlap_result, bilateral_mode, qt_threshold)
 
     tight_conflict_limit = max(
         20,
@@ -1884,6 +2059,7 @@ def classify_contig_prediction(
         and total_slack <= 30
         and qt_longest_match_run >= 30
         and qt_conflicts <= max(45, int(qt_matches * 0.20))
+        and longest_gap_run <= MAX_QT10_LONG_ANCHOR_GAP_RUN
     )
 
     if qt10_long_anchor_profile:
@@ -1946,6 +2122,21 @@ def classify_contig_prediction(
             "reason": (
                 f"조건 {condition_label}은 현재 보정 사례에서 "
                 "F/R 개별 출력 우선; junction 지표는 보조 근거"
+            ),
+        }
+
+    if (
+        condition_label in {"30/20", "25/21"}
+        and has_long_gapped_terminal_evidence(overlap_result)
+    ):
+        return {
+            "status": "Contig2 예상",
+            "rank": 1,
+            "reason": (
+                "긴 overlap은 있으나 gap/Quality 연결 기준 미충족; "
+                f"양측 Q{qt_threshold} 지지 최장 gap "
+                f"{overlap_result.get('qt_bilateral_longest_gap_run', longest_gap_run)} bp, "
+                f"Quality 가중 Identity {weighted_identity:.2f}%; F/R 개별 출력 예상"
             ),
         }
 
@@ -2087,6 +2278,12 @@ def classify_exploratory_prediction(
             "rank": 0,
             "reason": "; ".join(hard_failures),
         }
+
+    bilateral_mode = bilateral_terminal_rescue_mode(
+        overlap_result, qt_threshold, new_qt_threshold,
+    )
+    if bilateral_mode is not None:
+        return bilateral_rescue_prediction(overlap_result, bilateral_mode, qt_threshold)
 
     terminal_pass = (
         terminal_high_quality <= 30
@@ -2739,6 +2936,9 @@ def empty_overlap_result():
         "qt_supported_matches": 0,
         "qt_supported_longest_match_run": 0,
         "qt_supported_conflicts": 0,
+        "qt_bilateral_gap_bases": 0,
+        "qt_bilateral_longest_gap_run": 0,
+        "qt_bilateral_conflicts": 0,
         "connection_direction": "-",
         "reverse_orientation": "-",
         "left_tail_unaligned": None,
@@ -2831,6 +3031,8 @@ def evaluate_condition_values(
         ],
         "Gap": safe_overlap["gaps"],
         "최장 연속 Gap": safe_overlap["longest_gap_run"],
+        "양측 QT 지지 최장 Gap": safe_overlap["qt_bilateral_longest_gap_run"],
+        "양측 QT 지지 충돌": safe_overlap["qt_bilateral_conflicts"],
         "연결 방향": safe_overlap["connection_direction"],
         "Reverse 처리": safe_overlap["reverse_orientation"],
         "왼쪽 junction soft-clip": safe_overlap[
@@ -3154,31 +3356,12 @@ st.divider()
 st.subheader("조건 설정")
 
 st.caption(
-    "실제 분석에 사용하는 조건을 개별 프리셋으로 평가합니다. "
-    "16과 20은 New QT를 사용하지 않는 단독 QT 조건이며, "
-    "25/21은 실제 M13 결합 성공 사례가 확인된 조건입니다. "
-    "30/40과 단독 10도 유효한 독립 조건입니다. 현재 조건별 "
-    "출력 유형은 현재까지 확인된 AB1 쌍의 실제 결과를 기준으로 "
-    "보수적으로 보정되어 있으며, 추가 사례에 따라 갱신해야 "
-    "합니다. 20계열의 좋은 junction은 원칙적으로 Contig2를 "
-    "우선하지만, 단독 QT20은 overlap 내부가 매우 깨끗하고 junction "
-    "밖의 짧은 말단이 모두 Q20 미만인 확인된 구조에 한해 성공으로 "
-    "평가합니다. QT16은 75 bp 미만 overlap을 원칙적으로 Contig2로 "
-    "분류하지만, 한쪽 read가 짧고 전체 Quality가 높게 사전 정리된 "
-    "실제 성공 구조는 read 전체 지표를 함께 확인해 예외 처리합니다. "
-    "75 bp 이상에서도 gap이 많은 정렬 및 2 bp 이상 연속 gap은 "
-    "보수적으로 평가합니다. "
-    "30/20은 긴 overlap 전체의 유사도가 높고 junction에 남는 "
-    "고품질 말단이 적으면, 내부 gap이 2 bp 이하로 짧게 분산된 "
-    "유형도 별도 성공 패턴으로 평가합니다. 3 bp 이상 연속 gap은 "
-    "Contig2 위험으로 구분합니다. 일반 직접 결합형은 최소 75 bp의 "
-    "overlap을 요구하며, 75 bp 미만은 확인된 전체 read 구조까지 "
-    "충족한 경우에만 제한적으로 성공 처리합니다. 장거리 내부 "
-    "overlap은 정렬 밖 전체 "
-    "말단뿐 아니라 junction에 바로 붙은 60 bp의 평균 Quality도 "
-    "확인하여, 고품질 서열을 잘라야 하는 경우 Contig2로 봅니다. "
-    "Primer 파일명은 판정에 사용하지 않고 Reverse 원본과 "
-    "reverse-complement를 모두 비교해 정렬 방향을 선택합니다."
+    "16·10·20은 New QT 미사용 조건입니다. 20/10·30/20처럼 "
+    "두 숫자를 표시한 조건은 QT/New QT를 의미합니다. "
+    "실측 사례를 바탕으로 overlap·Quality·junction을 함께 평가하며, "
+    "긴 overlap의 gap은 반대 read의 주변 품질도 확인합니다. "
+    "회사 프로그램의 trimming을 그대로 재현한 결과는 아니며, "
+    "새 샘플과 확장 조건의 결과는 실제 분석에서 확인해 주세요."
 )
 
 selected_condition = st.selectbox(
@@ -3393,6 +3576,12 @@ if forward_file is not None and reverse_file is not None:
                                 "최장 연속 Gap": overlap_result[
                                     "longest_gap_run"
                                 ],
+                                "양측 QT 지지 최장 Gap": overlap_result[
+                                    "qt_bilateral_longest_gap_run"
+                                ],
+                                "양측 QT 지지 충돌": overlap_result[
+                                    "qt_bilateral_conflicts"
+                                ],
                             }
                         ]
                     )
@@ -3486,6 +3675,8 @@ if forward_file is not None and reverse_file is not None:
 - **Junction 인접 60 bp 평균 Q**는 overlap 바로 바깥에서 제거해야 하는 구간의 평균 품질입니다. 어느 한쪽이라도 Q24를 넘으면 신뢰도 높은 염기를 잘라야 하므로, 장거리 내부 overlap을 성공으로 자동 승격하지 않습니다.
 - **QT 최장 연속 Match**는 양쪽 염기가 모두 현재 QT 이상이면서 정확히 일치하는 구간 중 가장 긴 연속 길이입니다. QT 지지 Match 총량이 많아도 이 값이 짧으면 고품질 anchor가 여러 조각으로 끊긴 상태입니다.
 - **최장 연속 Gap**은 정렬 중 한 번에 연속해서 끊긴 길이입니다. Gap 총량이 비슷해도 연속 Gap이 길면 연결부 단절 위험을 더 크게 봅니다. 특히 New QT 보정이 없는 QT16은 2 bp부터 Contig2 경계로 평가합니다.
+- **양측 QT 지지 최장 Gap**은 gap 염기와 반대 read에서 gap을 둘러싼 두 염기의 Quality가 모두 현재 QT 이상인 연속 길이입니다. 원본 gap을 삭제하거나 실제 InDel 여부를 확정하는 지표가 아닙니다.
+- **양측 QT 지지 충돌**은 위 기준을 통과한 gap 염기에 양측 QT 이상 mismatch·불명확 염기를 더한 값입니다. 긴 overlap의 20/10·30/20 보정에서는 이 값과 연속 anchor, junction 잔여를 함께 확인합니다.
 - **단독 QT20 저품질 말단 제거형**은 짧은 terminal overlap이라도 Identity와 Q20 anchor가 높고, junction 밖 말단이 모두 Q20 미만이며 gap이 짧게 분산된 경우입니다. 현재 확인된 실제 성공 구조에만 제한적으로 적용합니다.
 - **사전 정리된 비대칭 read형**은 한쪽 read가 짧고 평균 Quality가 높으며 반대쪽 read는 길지만 충분한 Q30 구간을 유지하는 구조입니다. overlap이 75 bp 미만이어도 전체 read와 junction 기준을 모두 통과하면 확인된 표준 조건에서 성공으로 평가합니다.
 - **양쪽 긴 read의 Q30 core형**은 낮은 QT에서 긴 저품질 tail이 남아 Contig2가 되지만, 양쪽 Q30 read-through가 충분하면 30/20에서만 짧은 overlap을 제한적으로 사용할 수 있는 구조입니다.
