@@ -12,7 +12,6 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-import math
 import re
 import struct
 from dataclasses import asdict, dataclass
@@ -23,12 +22,12 @@ from Bio import SeqIO
 from Bio.Align import PairwiseAligner
 from Bio.Seq import Seq
 
-APP_VERSION = "2026.09.23-ab1-v2"
+APP_VERSION = "2026.09.28-ab1-v3"
 MAX_READ_BASES = 5000
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MIN_READ_BASES = 50
-MIN_OVERLAP_BASES = 40
-MIN_GAP_IDENTITY = 95.0
+MIN_OVERLAP_BASES = 30
+MIN_GAP_IDENTITY = 90.0
 MIN_Q20_MATCHES = 20
 MAX_Q20_CONFLICT_RATE = 0.02
 MAX_Q20_JUNCTION = 10
@@ -104,28 +103,34 @@ def read_ab1(data: bytes, filename: str, read_id: str) -> Read:
 
 
 def trim_read(read: Read, condition: Condition):
-    """이 도구의 전처리 가정: 평균 Q를 통과한 첫~마지막 window를 유지.
+    """원본 AB1과 실제 출력의 대응에서 복원한 전처리 규칙.
 
-    내부 저품질 염기는 삭제하지 않는다. Window 미사용 조건은 폭 1을 쓴다.
-    이 규칙은 외부 전처리 구현과의 동등성을 검증한 규칙이 아니다.
+    기본 QT: 양 끝에서 폭 10의 비중첩 구간을 검사한다. 뒤쪽 검사창은
+    현재 염기를 포함하고, 확인된 오른쪽 좌표를 slice의 배타적 끝으로 쓴다.
+    New QT: QT 이상 염기가 75% 이상인 첫 window에서 시작하고, 그 이후
+    window 평균 Q가 QT 미만이 되는 첫 위치에서 끝낸다. 내부를 이어붙이지 않는다.
+
+    제공된 12개 read 출력과 서열 전체가 일치한 복원 규칙이며, 미제공 조건까지
+    원래 구현과 동일하다고 보증하지 않는다. 파일명·서열 정답 조회는 사용하지 않는다.
     """
     if condition.second_qt_enabled:
         raise ValueError("지원하지 않는 추가 trimming 설정입니다.")
-    width = condition.window_size if condition.new_qt_enabled else 1
     n = len(read.sequence)
-    start = end = 0
-    if n >= width:
-        running = math.fsum(read.qualities[:width])
-        first = last = None
-        for index in range(n - width + 1):
-            if running / width >= condition.qt - 1e-12:
-                if first is None:
-                    first = index
-                last = index
-            if index + width < n:
-                running += read.qualities[index + width] - read.qualities[index]
-        if first is not None:
-            start, end = first, last + width
+    q = read.qualities
+    if condition.new_qt_enabled:
+        width = condition.window_size
+        start = next((i for i in range(n - width + 1)
+                      if 4 * sum(value >= condition.qt for value in q[i:i + width]) >= 3 * width), n)
+        end = next((i for i in range(start, n - width + 1)
+                    if sum(q[i:i + width]) < condition.qt * width), n)
+    else:
+        width = 10
+        start = next((i for i in range(0, n - width + 1, width)
+                      if sum(q[i:i + width]) >= condition.qt * width), n)
+        end = next((i for i in range(n - 1, width - 2, -width)
+                    if sum(q[i - width + 1:i + 1]) >= condition.qt * width), 0)
+    if start >= end:
+        start = end = 0
     trimmed = Read(read.name, read.sequence[start:end], read.qualities[start:end],
                    read.file_name, read.source_sha256)
     return trimmed, {
@@ -160,8 +165,9 @@ def inspect_overlap(forward: Read, reverse: Read):
         except IndexError:
             continue
         matches = mismatches = gaps = ambiguous = q20_matches = q20_conflicts = 0
+        q20_gap_conflicts = q20_base_conflicts = 0
         longest_gap = gap_run = 0
-        markers = []
+        markers, events = [], []
         f_cursor, r_cursor = int(alignment.coordinates[0, 0]), int(alignment.coordinates[1, 0])
         for i, j in zip(*alignment.indices):
             if i < 0 or j < 0:
@@ -174,6 +180,11 @@ def inspect_overlap(forward: Read, reverse: Read):
                 flank_q = min(other_q[cursor - 1:cursor + 1]) if 0 < cursor < len(other_q) else 0
                 q = min(forward.qualities[i] if i >= 0 else rq[j], flank_q)
                 q20_conflicts += q >= 20
+                q20_gap_conflicts += q >= 20
+                events.append({"column": len(markers) + 1, "kind": "R Gap" if i >= 0 else "F Gap",
+                               "f_position": int(i) + 1 if i >= 0 else None,
+                               "r_position": int(j) + 1 if j >= 0 else None,
+                               "support_q": int(q)})
                 if i >= 0:
                     f_cursor = i + 1
                 if j >= 0:
@@ -186,6 +197,9 @@ def inspect_overlap(forward: Read, reverse: Read):
             if fseq[i] not in "ACGT" or rseq[j] not in "ACGT":
                 ambiguous += 1
                 q20_conflicts += q >= 20
+                q20_base_conflicts += q >= 20
+                events.append({"column": len(markers) + 1, "kind": "모호한 염기",
+                               "f_position": int(i) + 1, "r_position": int(j) + 1, "support_q": int(q)})
                 markers.append("?")
             elif fseq[i] == rseq[j]:
                 matches += 1
@@ -194,6 +208,9 @@ def inspect_overlap(forward: Read, reverse: Read):
             else:
                 mismatches += 1
                 q20_conflicts += q >= 20
+                q20_base_conflicts += q >= 20
+                events.append({"column": len(markers) + 1, "kind": "염기 불일치",
+                               "f_position": int(i) + 1, "r_position": int(j) + 1, "support_q": int(q)})
                 markers.append(".")
         paired = matches + mismatches + ambiguous
         coordinates = alignment.coordinates
@@ -219,19 +236,27 @@ def inspect_overlap(forward: Read, reverse: Read):
             "matches": matches, "mismatches": mismatches, "gaps": gaps,
             "ambiguous": ambiguous, "longest_gap": longest_gap,
             "q20_matches": int(q20_matches), "q20_conflicts": int(q20_conflicts),
+            "q20_gap_conflicts": int(q20_gap_conflicts), "q20_base_conflicts": int(q20_base_conflicts),
             "q20_conflict_rate": q20_conflicts / support if support else 0,
+            "quality_identity": 100 * q20_matches / support if support else 0,
             "junction_unaligned": int(junction_raw), "junction_q20": int(junction_q20),
             "connection": connection,
             "reverse_orientation": "Reverse complement" if complemented else "원본 방향",
             "forward_start": fs, "forward_end": fe, "reverse_start": rs, "reverse_end": re_,
             "aligned_f": str(alignment[0]), "aligned_r": str(alignment[1]),
             "markers": "".join(markers),
+            "events": events,
         })
     return max(candidates, key=lambda x: (x["score"], x["paired_bases"], -x["junction_q20"])) if candidates else None
 
 
 def predict_contig(lengths, overlap):
-    """모든 조건에 같은 보수적 경험 규칙을 적용한다. 확률값은 만들지 않는다."""
+    """품질이 뒷받침하는 충돌과 낮은 품질의 차이를 분리해 평가한다.
+
+    한 개의 Q20 지지 단염기 gap은 짧은 겹침에서 비율만으로 기각하지 않는다.
+    복수의 Q20 충돌과 Q20 염기 불일치는 기존 충돌 비율 기준을 적용한다.
+    모든 조건에 동일한 규칙을 사용하며, 실측 성공 확률로 환산하지 않는다.
+    """
     if min(lengths) < MIN_READ_BASES:
         short = ", ".join(name for name, length in zip(("F", "R"), lengths) if length < MIN_READ_BASES)
         return {"label": "No contig", "state": "insufficient", "generated": False,
@@ -244,8 +269,10 @@ def predict_contig(lengths, overlap):
             reasons.append(f"Gap 포함 일치율이 {MIN_GAP_IDENTITY:g}% 미만입니다.")
         if overlap["q20_matches"] < MIN_Q20_MATCHES:
             reasons.append(f"양쪽 Q20 이상 일치가 {MIN_Q20_MATCHES} bp 미만입니다.")
-        if overlap["q20_conflict_rate"] > MAX_Q20_CONFLICT_RATE:
-            reasons.append(f"Q20 기준 충돌 비율이 {MAX_Q20_CONFLICT_RATE:.0%}를 초과합니다.")
+        single_indel = (overlap["q20_gap_conflicts"] == 1
+                        and overlap["q20_base_conflicts"] == 0 and overlap["longest_gap"] == 1)
+        if overlap["q20_conflict_rate"] > MAX_Q20_CONFLICT_RATE and not single_indel:
+            reasons.append(f"복수 Gap 또는 염기 불일치의 Q20 충돌 비율이 {MAX_Q20_CONFLICT_RATE:.0%}를 초과합니다.")
         if overlap["junction_q20"] > MAX_Q20_JUNCTION:
             reasons.append(f"연결 경계에 정렬되지 않은 Q20 이상 염기가 {MAX_Q20_JUNCTION} bp를 초과합니다.")
         if overlap["longest_gap"] > MAX_GAP_RUN:
@@ -284,6 +311,9 @@ def summary_rows(rows):
             "F 길이 (bp)": row["lengths"][0], "R 길이 (bp)": row["lengths"][1],
             "겹침 (bp)": overlap.get("paired_bases", 0),
             "Gap 포함 일치율 (%)": round(overlap.get("gap_identity", 0), 2),
+            "Q20 지지 일치율 (%)": round(overlap.get("quality_identity", 0), 2),
+            "Q20 염기 충돌": overlap.get("q20_base_conflicts", 0),
+            "Q20 Gap 충돌": overlap.get("q20_gap_conflicts", 0),
             "판정 근거": " / ".join(prediction["reasons"]), "분석 버전": APP_VERSION,
         })
     return records
@@ -349,16 +379,23 @@ def render_result(rows, reads):
         if overlap:
             st.write(f"R 처리: {overlap['reverse_orientation']} · 배치: {overlap['connection']}")
             st.write(f"Gap {overlap['gaps']} bp · 최장 Gap {overlap['longest_gap']} bp · "
-                     f"Q20 일치 {overlap['q20_matches']} bp · Q20 충돌 {overlap['q20_conflicts']}개")
+                     f"Q20 일치 {overlap['q20_matches']} bp · "
+                     f"Q20 염기 충돌 {overlap['q20_base_conflicts']}개 / Gap 충돌 {overlap['q20_gap_conflicts']}개")
             st.write(f"연결 경계의 정렬 밖 염기 {overlap['junction_unaligned']} bp "
                      f"(Q20 이상 {overlap['junction_q20']} bp)")
             st.code(alignment_preview(overlap), language=None)
+            if overlap["events"]:
+                st.dataframe(pd.DataFrame(overlap["events"]).rename(columns={
+                    "column": "정렬 위치", "kind": "차이 유형", "f_position": "F 위치",
+                    "r_position": "정렬 방향 R 위치", "support_q": "충돌 지지 Q",
+                }), hide_index=True, use_container_width=True)
         st.caption(
             f"공통 예측 기준: F/R 각각 {MIN_READ_BASES} bp 이상, 겹침 {MIN_OVERLAP_BASES} bp 이상, "
             f"Gap 포함 일치율 {MIN_GAP_IDENTITY:g}% 이상, 양쪽 Q20 일치 {MIN_Q20_MATCHES} bp 이상, "
             f"Q20 충돌 {MAX_Q20_CONFLICT_RATE:.0%} 이하, 연결 경계 Q20 잔여 {MAX_Q20_JUNCTION} bp 이하, "
-            f"최장 Gap {MAX_GAP_RUN} bp 이하. 전처리는 평균 Q 기준으로 양 끝을 정합니다. "
-            "이 기준은 실측 정확도가 검증된 기준이 아닙니다."
+            f"최장 Gap {MAX_GAP_RUN} bp 이하. Q20 염기 불일치 없이 단염기 Gap 하나만 "
+            "Q20으로 뒷받침되는 경우는 충돌 비율만으로 기각하지 않습니다. "
+            "제공된 사례로 보정한 예측 기준이며 새 샘플의 정확도는 별도 검증이 필요합니다."
         )
 
     with st.expander("AB1 원본 Quality", expanded=False):
@@ -398,7 +435,7 @@ def main():
         "version": APP_VERSION, "hashes": [sha256(data) for data in upload_bytes],
         "names": [f_upload.name, r_upload.name] if ready else [],
     }, sort_keys=True).encode())
-    result_key = "ab1_comparison_v2"
+    result_key = "ab1_comparison_v3"
     clicked = st.button("Contig 분석", type="primary", disabled=not ready, key="analyze_button")
     if clicked:
         st.session_state.pop(result_key, None)
