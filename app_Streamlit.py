@@ -22,7 +22,7 @@ from Bio import SeqIO
 from Bio.Align import PairwiseAligner
 from Bio.Seq import Seq
 
-APP_VERSION = "2026.09.28-ab1-v3"
+APP_VERSION = "2026.09.28-ab1-v4"
 MAX_READ_BASES = 5000
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MIN_READ_BASES = 50
@@ -32,6 +32,8 @@ MIN_Q20_MATCHES = 20
 MAX_Q20_CONFLICT_RATE = 0.02
 MAX_Q20_JUNCTION = 10
 MAX_GAP_RUN = 5
+CONFLICT_CLUSTER_COLUMNS = 100
+MIN_CLUSTER_Q20_CONFLICTS = 5
 
 
 @dataclass(frozen=True)
@@ -146,6 +148,27 @@ def normalize_sequence(sequence):
     return "".join(base if base in "ACGT" else "N" for base in sequence.upper())
 
 
+def conflict_cluster(events, alignment_columns):
+    """겹침 내부에서 Q20 충돌이 가장 많이 모인 구간을 찾는다.
+
+    폭은 gap을 포함한 정렬 열 수다. QT의 전처리 창과는 별개이며,
+    짧은 정렬에서는 정렬 전체를 사용한다. 위치는 1부터 시작한다.
+    """
+    width = min(CONFLICT_CLUSTER_COLUMNS, alignment_columns)
+    positions = [event["column"] for event in events if event["support_q"] >= 20]
+    best_count, best_start, left = 0, None, 0
+    for right, position in enumerate(positions):
+        while position - positions[left] >= width:
+            left += 1
+        count = right - left + 1
+        if count > best_count:
+            best_count = count
+            best_start = min(positions[left], alignment_columns - width + 1)
+    return {"count": best_count, "window_columns": width,
+            "start_column": best_start,
+            "end_column": best_start + width - 1 if best_start is not None else None}
+
+
 def inspect_overlap(forward: Read, reverse: Read):
     """두 방향의 국소 정렬 중 가장 높은 점수의 겹침을 평가한다."""
     if not forward.sequence or not reverse.sequence:
@@ -246,6 +269,7 @@ def inspect_overlap(forward: Read, reverse: Read):
             "aligned_f": str(alignment[0]), "aligned_r": str(alignment[1]),
             "markers": "".join(markers),
             "events": events,
+            "conflict_cluster": conflict_cluster(events, len(markers)),
         })
     return max(candidates, key=lambda x: (x["score"], x["paired_bases"], -x["junction_q20"])) if candidates else None
 
@@ -255,6 +279,7 @@ def predict_contig(lengths, overlap):
 
     한 개의 Q20 지지 단염기 gap은 짧은 겹침에서 비율만으로 기각하지 않는다.
     복수의 Q20 충돌과 Q20 염기 불일치는 기존 충돌 비율 기준을 적용한다.
+    긴 일치 구간이 국소 충돌을 희석하지 않도록 충돌 집중도도 검사한다.
     모든 조건에 동일한 규칙을 사용하며, 실측 성공 확률로 환산하지 않는다.
     """
     if min(lengths) < MIN_READ_BASES:
@@ -273,6 +298,14 @@ def predict_contig(lengths, overlap):
                         and overlap["q20_base_conflicts"] == 0 and overlap["longest_gap"] == 1)
         if overlap["q20_conflict_rate"] > MAX_Q20_CONFLICT_RATE and not single_indel:
             reasons.append(f"복수 Gap 또는 염기 불일치의 Q20 충돌 비율이 {MAX_Q20_CONFLICT_RATE:.0%}를 초과합니다.")
+        cluster = overlap["conflict_cluster"]
+        if cluster["count"] >= MIN_CLUSTER_Q20_CONFLICTS:
+            reasons.append(
+                f"정렬 {cluster['start_column']}–{cluster['end_column']} 위치의 "
+                f"{cluster['window_columns']}개 정렬 열 안에 Q20 충돌 "
+                f"{cluster['count']}개가 집중되어 있습니다 "
+                f"(기준 {MIN_CLUSTER_Q20_CONFLICTS}개 이상)."
+            )
         if overlap["junction_q20"] > MAX_Q20_JUNCTION:
             reasons.append(f"연결 경계에 정렬되지 않은 Q20 이상 염기가 {MAX_Q20_JUNCTION} bp를 초과합니다.")
         if overlap["longest_gap"] > MAX_GAP_RUN:
@@ -314,6 +347,9 @@ def summary_rows(rows):
             "Q20 지지 일치율 (%)": round(overlap.get("quality_identity", 0), 2),
             "Q20 염기 충돌": overlap.get("q20_base_conflicts", 0),
             "Q20 Gap 충돌": overlap.get("q20_gap_conflicts", 0),
+            "국소 Q20 충돌 최대 개수": overlap.get("conflict_cluster", {}).get("count", 0),
+            "국소 충돌 구간 시작 (정렬 위치)": overlap.get("conflict_cluster", {}).get("start_column"),
+            "국소 충돌 구간 끝 (정렬 위치)": overlap.get("conflict_cluster", {}).get("end_column"),
             "판정 근거": " / ".join(prediction["reasons"]), "분석 버전": APP_VERSION,
         })
     return records
@@ -383,6 +419,11 @@ def render_result(rows, reads):
                      f"Q20 염기 충돌 {overlap['q20_base_conflicts']}개 / Gap 충돌 {overlap['q20_gap_conflicts']}개")
             st.write(f"연결 경계의 정렬 밖 염기 {overlap['junction_unaligned']} bp "
                      f"(Q20 이상 {overlap['junction_q20']} bp)")
+            cluster = overlap["conflict_cluster"]
+            if cluster["count"]:
+                st.write(f"국소 Q20 충돌 최대 {cluster['count']}개 · "
+                         f"정렬 위치 {cluster['start_column']}–{cluster['end_column']} "
+                         f"({cluster['window_columns']}개 정렬 열)")
             st.code(alignment_preview(overlap), language=None)
             if overlap["events"]:
                 st.dataframe(pd.DataFrame(overlap["events"]).rename(columns={
@@ -395,6 +436,8 @@ def render_result(rows, reads):
             f"Q20 충돌 {MAX_Q20_CONFLICT_RATE:.0%} 이하, 연결 경계 Q20 잔여 {MAX_Q20_JUNCTION} bp 이하, "
             f"최장 Gap {MAX_GAP_RUN} bp 이하. Q20 염기 불일치 없이 단염기 Gap 하나만 "
             "Q20으로 뒷받침되는 경우는 충돌 비율만으로 기각하지 않습니다. "
+            f"겹침 내 {CONFLICT_CLUSTER_COLUMNS}개 정렬 열 안에 Q20 충돌 "
+            f"{MIN_CLUSTER_Q20_CONFLICTS}개 이상이 집중되면 통과시키지 않습니다. "
             "제공된 사례로 보정한 예측 기준이며 새 샘플의 정확도는 별도 검증이 필요합니다."
         )
 
@@ -435,7 +478,7 @@ def main():
         "version": APP_VERSION, "hashes": [sha256(data) for data in upload_bytes],
         "names": [f_upload.name, r_upload.name] if ready else [],
     }, sort_keys=True).encode())
-    result_key = "ab1_comparison_v3"
+    result_key = "ab1_comparison_v4"
     clicked = st.button("Contig 분석", type="primary", disabled=not ready, key="analyze_button")
     if clicked:
         st.session_state.pop(result_key, None)
