@@ -22,7 +22,7 @@ from Bio import SeqIO
 from Bio.Align import PairwiseAligner
 from Bio.Seq import Seq
 
-APP_VERSION = "2026.09.30-ab1-v5"
+APP_VERSION = "2026.10.02-ab1-v6"
 MAX_READ_BASES = 5000
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MIN_READ_BASES = 50
@@ -37,6 +37,10 @@ CONFLICT_CLUSTER_COLUMNS = 100
 MIN_CLUSTER_Q20_CONFLICTS = 5
 # 실제 조립 출력과 추가 대조가 필요한 검증용 보정 기준.
 MIN_BIDIRECTIONAL_GAP_REGIONS = 2
+TERMINAL_GAP_COLUMNS = 10
+LOW_QUALITY_END_COLUMNS = 12
+MAX_CORE_TRIM_COLUMNS = 5
+CORE_CONFLICT_QUALITY_LIMIT = 30
 
 
 @dataclass(frozen=True)
@@ -115,7 +119,7 @@ def trim_read(read: Read, condition: Condition):
     New QT: QT 이상 염기가 75% 이상인 첫 window에서 시작하고, 그 이후
     window 평균 Q가 QT 미만이 되는 첫 위치에서 끝낸다. 내부를 이어붙이지 않는다.
 
-    제공된 12개 read 출력과 서열 전체가 일치한 복원 규칙이며, 미제공 조건까지
+    제공된 16개 read 출력과 서열 전체가 일치한 복원 규칙이며, 미제공 조건까지
     원래 구현과 동일하다고 보증하지 않는다. 파일명·서열 정답 조회는 사용하지 않는다.
     """
     if condition.second_qt_enabled:
@@ -200,12 +204,13 @@ def conflict_cluster(events, alignment_columns):
             "end_column": best_start + width - 1 if best_start is not None else None}
 
 
-def inspect_overlap(forward: Read, reverse: Read):
-    """두 방향의 국소 정렬 중 가장 높은 점수의 겹침을 평가한다."""
+def _align_overlap(forward: Read, reverse: Read, scores):
+    """지정된 점수로 양방향 국소 정렬을 평가한다."""
     if not forward.sequence or not reverse.sequence:
         return None
-    aligner = PairwiseAligner(mode="local", match_score=2, mismatch_score=-3,
-                              open_gap_score=-5, extend_gap_score=-1)
+    match, mismatch, gap_open, gap_extend = scores
+    aligner = PairwiseAligner(mode="local", match_score=match, mismatch_score=mismatch,
+                              open_gap_score=gap_open, extend_gap_score=gap_extend)
     aligner.wildcard = "N"
     fseq = normalize_sequence(forward.sequence)
     candidates = []
@@ -306,26 +311,100 @@ def inspect_overlap(forward: Read, reverse: Read):
     return max(candidates, key=lambda x: (x["score"], x["paired_bases"], -x["junction_q20"])) if candidates else None
 
 
-def terminal_opposite_gaps(overlap):
-    """연결 끝까지 정렬된 양방향 단염기 gap 쌍에 대한 경험적 예외.
+def inspect_overlap(forward: Read, reverse: Read):
+    """긴 겹침과 말단 확장을 보수적으로 평가한 겹침을 함께 계산한다.
+
+    보수적 비교의 점수는 제공된 두 실제 정렬의 끝 좌표와 대응했다.
+    두 비교는 동일한 절단 서열을 사용하며 별도의 조립 프로그램을 실행하지 않는다.
+    """
+    overlap = _align_overlap(forward, reverse, (2, -3, -5, -1))
+    if overlap is not None:
+        overlap["core_alignment"] = _align_overlap(forward, reverse, (1, -2, -4, -3))
+    return overlap
+
+
+def terminal_gap_pair(overlap):
+    """연결 끝까지 정렬된 단염기 gap 쌍에 대한 경험적 예외.
 
     추가 gap·불일치·모호한 염기·정렬 밖 연결 말단이 있으면 적용하지 않는다.
+    같은 방향의 두 gap은 한 gap이 정렬 끝의 제한된 범위에 있을 때만 허용한다.
     관측 사례에서 얻은 보정이며 실제 조립 알고리즘을 복원한 규칙은 아니다.
     """
-    return (overlap["connection"] in ("F → R", "R → F")
+    eligible = (overlap["connection"] in ("F → R", "R → F")
             and overlap["junction_unaligned"] == 0
             and overlap["gaps"] == overlap["q20_gap_conflicts"] == 2
             and overlap["longest_gap"] == 1
-            and overlap["q20_gap_regions"] == {"F": 1, "R": 1}
             and overlap["mismatches"] == overlap["ambiguous"] == 0
             and overlap["q20_base_conflicts"] == 0)
+    if not eligible:
+        return False
+    counts = overlap["q20_gap_regions"]
+    if counts == {"F": 1, "R": 1}:
+        return True
+    if sorted(counts.values()) != [0, 2]:
+        return False
+    columns = len(overlap["markers"])
+    return any(min(e["column"], columns - e["column"] + 1) <= TERMINAL_GAP_COLUMNS
+               for e in overlap["events"])
+
+
+def unresolved_low_quality_end(overlap):
+    """말단의 저품질 gap·염기 불일치와 미정렬 연결 경계가 함께 남는지 확인."""
+    if overlap["junction_unaligned"] == 0:
+        return False
+    columns = len(overlap["markers"])
+    for start, end in ((1, min(columns, LOW_QUALITY_END_COLUMNS)),
+                       (max(1, columns - LOW_QUALITY_END_COLUMNS + 1), columns)):
+        events = [e for e in overlap["events"]
+                  if start <= e["column"] <= end and e["support_q"] < 20]
+        if (any(e["kind"] in ("F Gap", "R Gap") for e in events)
+                and any(e["kind"] in ("염기 불일치", "모호한 염기") for e in events)):
+            return True
+    return False
+
+
+def terminal_realign_supported(overlap):
+    """실제 염기를 바꾸지 않고 짧은 말단만 제외한 대체 정렬의 제한적 인정.
+
+    내부 gap 배치나 방향이 달라진 정렬, 고품질 충돌을 숨기는 절단은 제외한다.
+    이 허용 범위는 검증 자료로 보정한 값이며 보편적인 조립 기준이 아니다.
+    """
+    core = overlap.get("core_alignment")
+    if not core or overlap["q20_base_conflicts"] == 0:
+        return False
+    if (core["connection"] != overlap["connection"]
+            or core["reverse_orientation"] != overlap["reverse_orientation"]
+            or core["connection"] not in ("F → R", "R → F")
+            or core["mismatches"] or core["ambiguous"]
+            or core["paired_bases"] < MIN_OVERLAP_BASES
+            or core["q20_matches"] < MIN_Q20_MATCHES
+            or core["gap_identity"] < MIN_GAP_IDENTITY
+            or core["junction_q20"] > MAX_Q20_JUNCTION
+            or core["longest_gap"] > MAX_GAP_RUN):
+        return False
+    if any(e["support_q"] >= CORE_CONFLICT_QUALITY_LIMIT for e in core["events"]):
+        return False
+    removed = len(overlap["markers"]) - len(core["markers"])
+    if not 1 <= removed <= MAX_CORE_TRIM_COLUMNS:
+        return False
+    # 두 정렬 문자열에서 같은 연속 구간만 허용한다. 내부 재배치는 제외한다.
+    for left in range(removed + 1):
+        right = left + len(core["markers"])
+        if (overlap["aligned_f"][left:right] == core["aligned_f"]
+                and overlap["aligned_r"][left:right] == core["aligned_r"]):
+            excluded = [e for e in overlap["events"] if not left < e["column"] <= right]
+            if (any(e["kind"] in ("염기 불일치", "모호한 염기") and e["support_q"] >= 20
+                    for e in excluded)
+                    and all(e["support_q"] < CORE_CONFLICT_QUALITY_LIMIT for e in excluded)):
+                return True
+    return False
 
 
 def predict_contig(lengths, overlap, quality_bases=None):
     """품질이 뒷받침하는 충돌과 낮은 품질의 차이를 분리해 평가한다.
 
     한 개의 Q20 지지 단염기 gap은 짧은 겹침에서 비율만으로 기각하지 않는다.
-    연결 끝까지 정렬된 양방향 단염기 gap 쌍에도 제한적인 비율 예외를 적용한다.
+    연결 끝까지 정렬된 단염기 gap 쌍과 짧은 말단 제외에 제한적 비율 예외를 적용한다.
     그 밖의 복수 Q20 충돌과 Q20 염기 불일치는 기존 충돌 비율 기준을 적용한다.
     긴 일치 구간이 국소 충돌을 희석하지 않도록 충돌 집중도도 검사한다.
     Q20 유효 염기 수, 양쪽 반복 gap 검사, 말단 gap 쌍 예외는 검증용 보정이다.
@@ -344,6 +423,7 @@ def predict_contig(lengths, overlap, quality_bases=None):
                 "reasons": reasons}
     reasons = []
     terminal_gap_exception_applied = False
+    terminal_realign_applied = False
     if overlap is None or overlap["paired_bases"] < MIN_OVERLAP_BASES:
         reasons.append(f"연결에 필요한 겹침이 {MIN_OVERLAP_BASES} bp 미만입니다.")
     if overlap is not None:
@@ -355,10 +435,13 @@ def predict_contig(lengths, overlap, quality_bases=None):
                         and overlap["q20_base_conflicts"] == 0 and overlap["longest_gap"] == 1)
         terminal_gap_exception_applied = (
             overlap["q20_conflict_rate"] > MAX_Q20_CONFLICT_RATE
-            and terminal_opposite_gaps(overlap)
+            and terminal_gap_pair(overlap)
         )
+        terminal_realign_applied = (overlap["q20_conflict_rate"] > MAX_Q20_CONFLICT_RATE
+                                    and terminal_realign_supported(overlap))
         if (overlap["q20_conflict_rate"] > MAX_Q20_CONFLICT_RATE
-                and not single_indel and not terminal_gap_exception_applied):
+                and not single_indel and not terminal_gap_exception_applied
+                and not terminal_realign_applied):
             reasons.append(f"복수 Gap 또는 염기 불일치의 Q20 충돌 비율이 {MAX_Q20_CONFLICT_RATE:.0%}를 초과합니다.")
         cluster = overlap["conflict_cluster"]
         if cluster["count"] >= MIN_CLUSTER_Q20_CONFLICTS:
@@ -379,12 +462,20 @@ def predict_contig(lengths, overlap, quality_bases=None):
             reasons.append(f"연결 경계에 정렬되지 않은 Q20 이상 염기가 {MAX_Q20_JUNCTION} bp를 초과합니다.")
         if overlap["longest_gap"] > MAX_GAP_RUN:
             reasons.append(f"연속 Gap이 {MAX_GAP_RUN} bp를 초과합니다.")
+        if unresolved_low_quality_end(overlap):
+            reasons.append(f"겹침 끝 {LOW_QUALITY_END_COLUMNS}개 정렬 열에 저품질 Gap과 "
+                           "염기 불일치가 함께 있고, 연결 경계의 미정렬 염기도 남아 있습니다 "
+                           "(검증용 보정).")
     if reasons:
         return {"label": "Contig2", "state": "separate", "generated": False, "reasons": reasons}
     passed = ["겹침 길이·일치율·품질·연결 경계 기준을 통과했습니다."]
     if terminal_gap_exception_applied:
-        passed.append("연결 끝까지 정렬되고 양쪽의 단염기 Gap 두 개만 있어 "
+        passed.append("연결 끝까지 정렬된 단염기 Gap 두 개의 방향과 말단 위치 조건으로 "
                       "충돌 비율 예외를 적용했습니다 (검증용 보정).")
+    if terminal_realign_applied:
+        passed.append(f"말단 {MAX_CORE_TRIM_COLUMNS}개 정렬 열 이내를 제외한 비교에서 "
+                      f"염기 불일치가 해소되고 남은 Gap의 지지 Q가 {CORE_CONFLICT_QUALITY_LIMIT} 미만입니다 "
+                      "(충돌 비율 예외: 검증용 보정).")
     return {"label": "Contig 생성", "state": "joined", "generated": True,
             "reasons": passed}
 
@@ -427,6 +518,8 @@ def summary_rows(rows):
             "R Q20 Gap 구간": overlap.get("q20_gap_regions", {}).get("R", 0),
             "연결 경계 잔여 (bp)": overlap.get("junction_unaligned", 0),
             "연결 경계 Q20 잔여 (bp)": overlap.get("junction_q20", 0),
+            "말단 보수적 비교 겹침 (bp)": (overlap.get("core_alignment") or {}).get("paired_bases", 0),
+            "말단 보수적 비교 Gap (bp)": (overlap.get("core_alignment") or {}).get("gaps", 0),
             "국소 Q20 충돌 최대 개수": overlap.get("conflict_cluster", {}).get("count", 0),
             "국소 충돌 구간 시작 (정렬 위치)": overlap.get("conflict_cluster", {}).get("start_column"),
             "국소 충돌 구간 끝 (정렬 위치)": overlap.get("conflict_cluster", {}).get("end_column"),
@@ -509,6 +602,11 @@ def render_result(rows, reads):
                          f"정렬 위치 {cluster['start_column']}–{cluster['end_column']} "
                          f"({cluster['window_columns']}개 정렬 열)")
             st.code(alignment_preview(overlap), language=None)
+            core = overlap.get("core_alignment")
+            if core:
+                st.write(f"말단 확장을 보수적으로 평가한 비교: 겹침 {core['paired_bases']} bp · "
+                         f"Gap {core['gaps']} bp · 연결 경계 잔여 {core['junction_unaligned']} bp")
+                st.code(alignment_preview(core), language=None)
             if overlap["events"]:
                 st.dataframe(pd.DataFrame(overlap["events"]).rename(columns={
                     "column": "정렬 위치", "kind": "차이 유형", "f_position": "F 위치",
@@ -527,6 +625,12 @@ def render_result(rows, reads):
             "이상이면 Contig2로 예측합니다. "
             "연결되는 두 끝까지 정렬되고, 차이가 양쪽의 Q20 단염기 Gap 한 개씩뿐이면 "
             "충돌 비율 예외를 적용하되 나머지 기준은 그대로 검사합니다. "
+            f"같은 방향의 단염기 Gap 두 개는 한 개가 정렬 끝 {TERMINAL_GAP_COLUMNS}개 열 안에 "
+            "있는 경우에만 해당 예외를 적용합니다. "
+            f"짧은 말단 제외({MAX_CORE_TRIM_COLUMNS}개 열 이내)의 대체 정렬은 Q30 이상 충돌을 "
+            "숨기지 않는 경우에 한해 평가합니다. "
+            f"말단 {LOW_QUALITY_END_COLUMNS}개 열에 저품질 Gap·염기 불일치와 미정렬 연결 경계가 "
+            "함께 남는 경우는 Contig2로 예측합니다. "
             "제공된 사례로 보정한 예측 기준이며 새 샘플의 정확도는 별도 검증이 필요합니다."
         )
 
@@ -567,7 +671,7 @@ def main():
         "version": APP_VERSION, "hashes": [sha256(data) for data in upload_bytes],
         "names": [f_upload.name, r_upload.name] if ready else [],
     }, sort_keys=True).encode())
-    result_key = "ab1_comparison_v5"
+    result_key = "ab1_comparison_v6"
     clicked = st.button("Contig 분석", type="primary", disabled=not ready, key="analyze_button")
     if clicked:
         st.session_state.pop(result_key, None)
