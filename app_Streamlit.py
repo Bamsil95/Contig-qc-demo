@@ -22,7 +22,7 @@ from Bio import SeqIO
 from Bio.Align import PairwiseAligner
 from Bio.Seq import Seq
 
-APP_VERSION = "2026.10.02-ab1-v7"
+APP_VERSION = "2026.10.07-ab1-v8"
 MAX_READ_BASES = 5000
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MIN_READ_BASES = 50
@@ -38,6 +38,8 @@ MIN_CLUSTER_Q20_CONFLICTS = 5
 # 실제 조립 출력과 추가 대조가 필요한 검증용 보정 기준.
 MIN_BIDIRECTIONAL_GAP_REGIONS = 2
 MIN_GAP_PAIR_OUTER_Q20 = 10
+MAX_SHORT_GAP_PAIR_BASES = 100
+MIN_MIXED_GAP_Q20_RUN = 30
 TERMINAL_GAP_COLUMNS = 10
 LOW_QUALITY_END_COLUMNS = 12
 MAX_CORE_TRIM_COLUMNS = 5
@@ -205,6 +207,47 @@ def gap_outer_q20_anchors(events, q20_agreements):
     return anchors
 
 
+def opposing_gap_pair_evidence(events, q20_agreements):
+    """반대 방향 단염기 gap 두 개 사이의 품질 지지를 요약한다.
+
+    Q20 미만 gap도 구조상 차이로 유지한다. 연속 지지는 두 gap 사이만 세며,
+    떨어진 일치 구간, gap 바깥쪽 일치, 한쪽만 높은 품질은 합산하지 않는다.
+    """
+    gaps = [e for e in events if e["kind"] in ("F Gap", "R Gap")]
+    if len(gaps) != 2 or {e["kind"] for e in gaps} != {"F Gap", "R Gap"}:
+        return None
+    left, right = sorted(e["column"] - 1 for e in gaps)
+    if right - left <= 1:
+        return None
+    longest = current = 0
+    for agreement in q20_agreements[left + 1:right]:
+        current = current + 1 if agreement else 0
+        longest = max(longest, current)
+    return {"q20_gap_count": sum(e["support_q"] >= 20 for e in gaps),
+            "between_columns": right - left - 1, "between_q20_run": longest}
+
+
+def short_gap_pair_reasons(overlap):
+    """짧은 연결에서 저품질 gap을 포함한 반대 방향 쌍을 검토한다.
+
+    제공된 실측 사례에 근거한 보정이며 일반적인 조립 기준은 아니다.
+    단일 gap, 같은 방향 gap, 긴 겹침과 포함 정렬에는 이 보정을 적용하지 않는다.
+    """
+    pair = overlap.get("opposing_gap_pair")
+    if (pair is None or overlap["paired_bases"] > MAX_SHORT_GAP_PAIR_BASES
+            or overlap["connection"] not in ("F → R", "R → F")):
+        return []
+    if pair["q20_gap_count"] == 0 and overlap["junction_unaligned"] > 0:
+        return ["짧은 겹침에 서로 반대 방향의 저품질 Gap 두 개가 있고, "
+                f"연결 끝에 미정렬 염기 {overlap['junction_unaligned']} bp가 남아 있습니다 "
+                "(검증용 보정)."]
+    if pair["q20_gap_count"] == 1 and pair["between_q20_run"] < MIN_MIXED_GAP_Q20_RUN:
+        return ["짧은 겹침에 Q20 이상 Gap과 저품질 Gap이 반대 방향으로 있으며, "
+                f"두 Gap 사이의 연속 Q20 일치가 {pair['between_q20_run']} bp로 "
+                f"기준 {MIN_MIXED_GAP_Q20_RUN} bp 미만입니다 (검증용 보정)."]
+    return []
+
+
 def conflict_cluster(events, alignment_columns):
     """겹침 내부에서 Q20 충돌이 가장 많이 모인 구간을 찾는다.
 
@@ -332,6 +375,7 @@ def _align_overlap(forward: Read, reverse: Read, scores):
             "conflict_cluster": conflict_cluster(events, len(markers)),
             "q20_gap_regions": supported_gap_regions(events),
             "gap_outer_q20_anchors": gap_outer_q20_anchors(events, q20_agreements),
+            "opposing_gap_pair": opposing_gap_pair_evidence(events, q20_agreements),
         })
     return max(candidates, key=lambda x: (x["score"], x["paired_bases"], -x["junction_q20"])) if candidates else None
 
@@ -433,7 +477,8 @@ def predict_contig(lengths, overlap, quality_bases=None):
     연결 끝까지 정렬된 단염기 gap 쌍과 짧은 말단 제외에 제한적 비율 예외를 적용한다.
     그 밖의 복수 Q20 충돌과 Q20 염기 불일치는 기존 충돌 비율 기준을 적용한다.
     긴 일치 구간이 국소 충돌을 희석하지 않도록 충돌 집중도도 검사한다.
-    Q20 유효 염기 수, 양쪽 반복 gap 검사, 말단 gap 쌍과 외측 지지는 검증용 보정이다.
+    Q20 유효 염기 수, 양쪽 반복 gap 검사, 말단 gap 쌍과 연속 지지는 검증용 보정이다.
+    짧은 겹침에서는 저품질 gap도 포함한 반대 방향 쌍을 별도로 검토한다.
     모든 조건에 동일한 규칙을 사용하며, 실측 성공 확률로 환산하지 않는다.
     """
     if min(lengths) < MIN_READ_BASES:
@@ -488,6 +533,7 @@ def predict_contig(lengths, overlap, quality_bases=None):
             reasons.append(f"연결 경계에 정렬되지 않은 Q20 이상 염기가 {MAX_Q20_JUNCTION} bp를 초과합니다.")
         if overlap["longest_gap"] > MAX_GAP_RUN:
             reasons.append(f"연속 Gap이 {MAX_GAP_RUN} bp를 초과합니다.")
+        reasons.extend(short_gap_pair_reasons(overlap))
         if unresolved_low_quality_end(overlap):
             reasons.append(f"겹침 끝 {LOW_QUALITY_END_COLUMNS}개 정렬 열에 저품질 Gap과 "
                            "염기 불일치가 함께 있고, 연결 경계의 미정렬 염기도 남아 있습니다 "
@@ -549,6 +595,8 @@ def summary_rows(rows):
             "R Q20 Gap 구간": overlap.get("q20_gap_regions", {}).get("R", 0),
             "첫 Gap 앞 연속 Q20 일치 (bp)": overlap.get("gap_outer_q20_anchors", {}).get("left", 0),
             "마지막 Gap 뒤 연속 Q20 일치 (bp)": overlap.get("gap_outer_q20_anchors", {}).get("right", 0),
+            "반대 방향 Gap 쌍 사이 최장 연속 Q20 일치 (bp)": (overlap.get("opposing_gap_pair") or {}).get("between_q20_run"),
+            "반대 방향 Gap 쌍 중 Q20 이상 개수": (overlap.get("opposing_gap_pair") or {}).get("q20_gap_count"),
             "연결 경계 잔여 (bp)": overlap.get("junction_unaligned", 0),
             "연결 경계 Q20 잔여 (bp)": overlap.get("junction_q20", 0),
             "말단 보수적 비교 겹침 (bp)": (overlap.get("core_alignment") or {}).get("paired_bases", 0),
@@ -633,6 +681,10 @@ def render_result(rows, reads):
                 anchors = overlap["gap_outer_q20_anchors"]
                 st.write(f"Gap 바깥쪽 연속 Q20 일치: 첫 Gap 앞 {anchors['left']} bp · "
                          f"마지막 Gap 뒤 {anchors['right']} bp")
+            pair = overlap.get("opposing_gap_pair")
+            if pair:
+                st.write(f"반대 방향 Gap 두 개 중 Q20 이상 {pair['q20_gap_count']}개 · "
+                         f"두 Gap 사이 최장 연속 Q20 일치 {pair['between_q20_run']} bp")
             cluster = overlap["conflict_cluster"]
             if cluster["count"]:
                 st.write(f"국소 Q20 충돌 최대 {cluster['count']}개 · "
@@ -663,6 +715,10 @@ def render_result(rows, reads):
             "연결되는 두 끝까지 정렬되고, 차이가 양쪽의 Q20 단염기 Gap 한 개씩뿐이면 "
             f"첫 Gap 앞 또는 마지막 Gap 뒤에 연속 Q20 일치가 {MIN_GAP_PAIR_OUTER_Q20} bp "
             "이상 있는 경우에만 충돌 비율 예외를 적용합니다. 나머지 기준도 검사합니다. "
+            f"{MAX_SHORT_GAP_PAIR_BASES} bp 이하의 연결 겹침에서 반대 방향 단염기 Gap "
+            "두 개가 모두 저품질이면 미정렬 연결 끝이 남는 경우 Contig2로 예측합니다. "
+            f"한 Gap만 Q20 이상이면 두 Gap 사이에 연속 Q20 일치가 {MIN_MIXED_GAP_Q20_RUN} bp "
+            "이상 있어야 합니다. 전체 Q20 일치 합계와 별도로 검사합니다. "
             f"같은 방향의 단염기 Gap 두 개는 한 개가 정렬 끝 {TERMINAL_GAP_COLUMNS}개 열 안에 "
             "있는 경우에만 해당 예외를 적용합니다. "
             f"짧은 말단 제외({MAX_CORE_TRIM_COLUMNS}개 열 이내)의 대체 정렬은 Q30 이상 충돌을 "
@@ -709,7 +765,7 @@ def main():
         "version": APP_VERSION, "hashes": [sha256(data) for data in upload_bytes],
         "names": [f_upload.name, r_upload.name] if ready else [],
     }, sort_keys=True).encode())
-    result_key = "ab1_comparison_v7"
+    result_key = "ab1_comparison_v8"
     clicked = st.button("Contig 분석", type="primary", disabled=not ready, key="analyze_button")
     if clicked:
         st.session_state.pop(result_key, None)
