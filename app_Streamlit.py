@@ -22,7 +22,7 @@ from Bio import SeqIO
 from Bio.Align import PairwiseAligner
 from Bio.Seq import Seq
 
-APP_VERSION = "2026.10.07-ab1-v8"
+APP_VERSION = "2026.10.07-ab1-v9"
 MAX_READ_BASES = 5000
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MIN_READ_BASES = 50
@@ -44,6 +44,15 @@ TERMINAL_GAP_COLUMNS = 10
 LOW_QUALITY_END_COLUMNS = 12
 MAX_CORE_TRIM_COLUMNS = 5
 CORE_CONFLICT_QUALITY_LIMIT = 30
+# 긴 겹침의 다수가 Q20 미만일 때만 사용하는 경험적 보정.
+# 전체 판정 기준을 낮추지 않고, 강한 품질 충돌과 연결 위치를 별도로 검사한다.
+LONG_OVERLAP_MIN_IDENTITY = 70.0
+LONG_OVERLAP_MIN_SCORE = 100.0
+LONG_OVERLAP_MIN_Q20_MATCHES = 10
+LONG_OVERLAP_MAX_Q20_FRACTION = 0.5
+LONG_OVERLAP_MAX_Q30_CONFLICTS = 2
+LONG_OVERLAP_MAX_JUNCTION = 50
+LONG_OVERLAP_MAX_Q20_JUNCTION = 20
 
 
 @dataclass(frozen=True)
@@ -470,6 +479,40 @@ def terminal_realign_supported(overlap):
     return False
 
 
+def long_overlap_evidence(overlap):
+    """긴 저품질 겹침을 위한 제한적 보정의 근거와 각 검사 결과.
+
+    Q20 이상 충돌을 모두 같은 강도로 취급하는 기존 규칙은 낮은 품질이
+    많은 긴 겹침을 과도하게 배제할 수 있다. 정렬 열의 과반수가 양쪽 Q20
+    지지를 갖지 못하는 긴 연결만 별도 검토한다. Q30 충돌이 반복되거나
+    연결 위치·정렬 점수·최소 일치 지지가 부족하면 허용하지 않는다.
+
+    한쪽 read의 Q만으로 충돌을 세지 않는다. Gap도 기존의 양쪽 인접 품질
+    규칙을 그대로 사용한다. 파일명, primer, QT 값, 실측 정답은 입력하지
+    않는다. 보정 자료 재현을 위한 경험적 기준이며 독립 검증된 확률이 아니다.
+    """
+    if overlap is None:
+        return {"accepted": False, "q20_supported_fraction": None,
+                "q30_conflicts": 0, "checks": {}}
+    q20_fraction = ((overlap["q20_matches"] + overlap["q20_conflicts"])
+                    / max(1, len(overlap["markers"])))
+    q30_conflicts = sum(e["support_q"] >= 30 for e in overlap["events"])
+    checks = {
+        "겹침 길이": overlap["paired_bases"] > MAX_SHORT_GAP_PAIR_BASES,
+        "저품질 비중": q20_fraction < LONG_OVERLAP_MAX_Q20_FRACTION,
+        "전체 일치율": overlap["gap_identity"] >= LONG_OVERLAP_MIN_IDENTITY,
+        "정렬 점수": overlap["score"] >= LONG_OVERLAP_MIN_SCORE,
+        "Q20 일치 지지": overlap["q20_matches"] >= LONG_OVERLAP_MIN_Q20_MATCHES,
+        "Q30 충돌": q30_conflicts <= LONG_OVERLAP_MAX_Q30_CONFLICTS,
+        "연결 배치": overlap["connection"] in ("F → R", "R → F"),
+        "연결 경계 잔여": overlap["junction_unaligned"] <= LONG_OVERLAP_MAX_JUNCTION,
+        "연결 경계 Q20 잔여": overlap["junction_q20"] <= LONG_OVERLAP_MAX_Q20_JUNCTION,
+        "최장 Gap": overlap["longest_gap"] <= MAX_GAP_RUN,
+    }
+    return {"accepted": all(checks.values()), "q20_supported_fraction": q20_fraction,
+            "q30_conflicts": int(q30_conflicts), "checks": checks}
+
+
 def predict_contig(lengths, overlap, quality_bases=None):
     """품질이 뒷받침하는 충돌과 낮은 품질의 차이를 분리해 평가한다.
 
@@ -479,6 +522,7 @@ def predict_contig(lengths, overlap, quality_bases=None):
     긴 일치 구간이 국소 충돌을 희석하지 않도록 충돌 집중도도 검사한다.
     Q20 유효 염기 수, 양쪽 반복 gap 검사, 말단 gap 쌍과 연속 지지는 검증용 보정이다.
     짧은 겹침에서는 저품질 gap도 포함한 반대 방향 쌍을 별도로 검토한다.
+    긴 저품질 겹침은 별도의 품질·배치 검사를 모두 통과할 때만 보정한다.
     모든 조건에 동일한 규칙을 사용하며, 실측 성공 확률로 환산하지 않는다.
     """
     if min(lengths) < MIN_READ_BASES:
@@ -538,6 +582,20 @@ def predict_contig(lengths, overlap, quality_bases=None):
             reasons.append(f"겹침 끝 {LOW_QUALITY_END_COLUMNS}개 정렬 열에 저품질 Gap과 "
                            "염기 불일치가 함께 있고, 연결 경계의 미정렬 염기도 남아 있습니다 "
                            "(검증용 보정).")
+    evidence = long_overlap_evidence(overlap)
+    if reasons and evidence["accepted"]:
+        return {"label": "Contig 생성", "state": "joined", "generated": True,
+                "decision_rule": "long_low_quality", "standard_reasons": reasons,
+                "reasons": [
+                    "긴 저품질 겹침의 별도 품질·배치 기준을 모두 통과했습니다 (검증용 보정).",
+                    f"겹침 {overlap['paired_bases']} bp · 전체 일치율 {overlap['gap_identity']:.1f}% · "
+                    f"정렬 점수 {overlap['score']:g} · 양쪽 Q20 일치 {overlap['q20_matches']} bp.",
+                    f"양쪽 Q20 지지 비중 {evidence['q20_supported_fraction']:.1%} · "
+                    f"양쪽 Q30 충돌 {evidence['q30_conflicts']}개 "
+                    f"(허용 {LONG_OVERLAP_MAX_Q30_CONFLICTS}개 이하).",
+                    f"연결 끝 미정렬 {overlap['junction_unaligned']} bp "
+                    f"(Q20 이상 {overlap['junction_q20']} bp)로 허용 범위 안에 있습니다.",
+                ]}
     if reasons:
         return {"label": "Contig2", "state": "separate", "generated": False, "reasons": reasons}
     passed = ["겹침 길이·일치율·품질·연결 경계 기준을 통과했습니다."]
@@ -580,6 +638,7 @@ def summary_rows(rows):
     for row in rows:
         overlap = row["overlap"] or {}
         prediction = row["prediction"]
+        evidence = long_overlap_evidence(row["overlap"])
         records.append({
             "조건": row["condition"]["label"], "예측 결과": prediction["label"],
             "Contig 생성 예측": "생성" if prediction["generated"] else "생성 안 됨",
@@ -591,6 +650,10 @@ def summary_rows(rows):
             "Q20 지지 일치율 (%)": round(overlap.get("quality_identity", 0), 2),
             "Q20 염기 충돌": overlap.get("q20_base_conflicts", 0),
             "Q20 Gap 충돌": overlap.get("q20_gap_conflicts", 0),
+            "Q30 충돌": evidence["q30_conflicts"],
+            "양쪽 Q20 지지 비중 (%)": (round(100 * evidence["q20_supported_fraction"], 2)
+                                    if evidence["q20_supported_fraction"] is not None else None),
+            "긴 저품질 겹침 보정 적용": prediction.get("decision_rule") == "long_low_quality",
             "F Q20 Gap 구간": overlap.get("q20_gap_regions", {}).get("F", 0),
             "R Q20 Gap 구간": overlap.get("q20_gap_regions", {}).get("R", 0),
             "첫 Gap 앞 연속 Q20 일치 (bp)": overlap.get("gap_outer_q20_anchors", {}).get("left", 0),
@@ -661,6 +724,10 @@ def render_result(rows, reads):
         st.write("**" + row["prediction"]["label"] + " 예측 근거**")
         for reason in row["prediction"]["reasons"]:
             st.write("• " + reason)
+        if row["prediction"].get("standard_reasons"):
+            st.write("기본 기준에서 검토가 필요했던 항목:")
+            for reason in row["prediction"]["standard_reasons"]:
+                st.write("• " + reason)
         st.dataframe(pd.DataFrame(row["trim_metadata"]).rename(columns={
             "read": "Read", "start_1based": "시작 위치", "end_1based": "끝 위치",
             "original_bases": "원본 길이", "retained_bases": "남은 길이",
@@ -690,6 +757,14 @@ def render_result(rows, reads):
                 st.write(f"국소 Q20 충돌 최대 {cluster['count']}개 · "
                          f"정렬 위치 {cluster['start_column']}–{cluster['end_column']} "
                          f"({cluster['window_columns']}개 정렬 열)")
+            evidence = long_overlap_evidence(overlap)
+            st.write(f"양쪽 Q30 충돌 {evidence['q30_conflicts']}개 · "
+                     f"양쪽 Q20 지지 비중 {evidence['q20_supported_fraction']:.1%}")
+            if overlap["paired_bases"] > MAX_SHORT_GAP_PAIR_BASES:
+                st.dataframe(pd.DataFrame([
+                    {"긴 저품질 겹침 보정 항목": name, "충족": passed}
+                    for name, passed in evidence["checks"].items()
+                ]), hide_index=True, use_container_width=True)
             st.code(alignment_preview(overlap), language=None)
             core = overlap.get("core_alignment")
             if core:
@@ -725,6 +800,14 @@ def render_result(rows, reads):
             "숨기지 않는 경우에 한해 평가합니다. "
             f"말단 {LOW_QUALITY_END_COLUMNS}개 열에 저품질 Gap·염기 불일치와 미정렬 연결 경계가 "
             "함께 남는 경우는 Contig2로 예측합니다. "
+            f"긴 저품질 겹침 보정: 겹침 {MAX_SHORT_GAP_PAIR_BASES} bp 초과이고 양쪽 Q20 "
+            f"지지 비중이 {LONG_OVERLAP_MAX_Q20_FRACTION:.0%} 미만이면 별도 기준을 검사합니다. "
+            f"일치율 {LONG_OVERLAP_MIN_IDENTITY:g}% 이상, 정렬 점수 {LONG_OVERLAP_MIN_SCORE:g} 이상, "
+            f"양쪽 Q20 일치 {LONG_OVERLAP_MIN_Q20_MATCHES} bp 이상, 양쪽 Q30 충돌 "
+            f"{LONG_OVERLAP_MAX_Q30_CONFLICTS}개 이하, F→R 또는 R→F 연결 배치, "
+            f"연결 끝 미정렬 {LONG_OVERLAP_MAX_JUNCTION} bp 이하 "
+            f"(Q20 이상 {LONG_OVERLAP_MAX_Q20_JUNCTION} bp 이하), 최장 Gap {MAX_GAP_RUN} bp 이하를 "
+            "모두 충족할 때만 생성으로 보정합니다. 유효 서열 부족에는 적용하지 않습니다. "
             "제공된 사례로 보정한 예측 기준이며 새 샘플의 정확도는 별도 검증이 필요합니다."
         )
 
@@ -765,7 +848,7 @@ def main():
         "version": APP_VERSION, "hashes": [sha256(data) for data in upload_bytes],
         "names": [f_upload.name, r_upload.name] if ready else [],
     }, sort_keys=True).encode())
-    result_key = "ab1_comparison_v8"
+    result_key = "ab1_comparison_v9"
     clicked = st.button("Contig 분석", type="primary", disabled=not ready, key="analyze_button")
     if clicked:
         st.session_state.pop(result_key, None)
