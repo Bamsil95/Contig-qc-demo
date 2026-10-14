@@ -22,7 +22,7 @@ from Bio import SeqIO
 from Bio.Align import PairwiseAligner
 from Bio.Seq import Seq
 
-APP_VERSION = "2026.10.07-ab1-v9"
+APP_VERSION = "2026.10.14-ab1-v10"
 MAX_READ_BASES = 5000
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MIN_READ_BASES = 50
@@ -427,10 +427,45 @@ def terminal_gap_pair(overlap):
                for e in overlap["events"])
 
 
+def terminal_low_quality_gap_regions(overlap):
+    """미정렬 연결 끝과 함께 남는 복수 저품질 말단 gap 구간.
+
+    같은 방향의 연속 gap은 길이와 관계없이 한 구간으로 센다. 구간 전체가
+    Q20 미만이고 같은 말단 검사창 안에 들어가야 한다. 높은 품질의 일부를
+    창 밖으로 잘라 저품질 gap으로 바꾸거나, 한 긴 gap을 여러 개로 세지 않는다.
+    제공된 실제 출력으로 보완한 경험적 검사이며 조립 알고리즘의 복원은 아니다.
+    """
+    if overlap is None or overlap["junction_unaligned"] == 0:
+        return []
+    regions = []
+    for event in overlap["events"]:
+        if event["kind"] not in ("F Gap", "R Gap"):
+            continue
+        if (regions and regions[-1]["kind"] == event["kind"]
+                and regions[-1]["end_column"] + 1 == event["column"]):
+            region = regions[-1]
+            region["end_column"] = event["column"]
+            region["max_support_q"] = max(region["max_support_q"], event["support_q"])
+        else:
+            regions.append({"kind": event["kind"], "start_column": event["column"],
+                            "end_column": event["column"], "max_support_q": event["support_q"]})
+    columns = len(overlap["markers"])
+    for start, end in ((1, min(columns, LOW_QUALITY_END_COLUMNS)),
+                       (max(1, columns - LOW_QUALITY_END_COLUMNS + 1), columns)):
+        low = [region for region in regions
+               if start <= region["start_column"] <= region["end_column"] <= end
+               and region["max_support_q"] < 20]
+        if len(low) >= 2:
+            return low
+    return []
+
+
 def unresolved_low_quality_end(overlap):
-    """말단의 저품질 gap·염기 불일치와 미정렬 연결 경계가 함께 남는지 확인."""
+    """말단의 복합 저품질 차이와 미정렬 연결 경계가 함께 남는지 확인."""
     if overlap["junction_unaligned"] == 0:
         return False
+    if terminal_low_quality_gap_regions(overlap):
+        return True
     columns = len(overlap["markers"])
     for start, end in ((1, min(columns, LOW_QUALITY_END_COLUMNS)),
                        (max(1, columns - LOW_QUALITY_END_COLUMNS + 1), columns)):
@@ -579,9 +614,18 @@ def predict_contig(lengths, overlap, quality_bases=None):
             reasons.append(f"연속 Gap이 {MAX_GAP_RUN} bp를 초과합니다.")
         reasons.extend(short_gap_pair_reasons(overlap))
         if unresolved_low_quality_end(overlap):
-            reasons.append(f"겹침 끝 {LOW_QUALITY_END_COLUMNS}개 정렬 열에 저품질 Gap과 "
-                           "염기 불일치가 함께 있고, 연결 경계의 미정렬 염기도 남아 있습니다 "
-                           "(검증용 보정).")
+            terminal_gaps = terminal_low_quality_gap_regions(overlap)
+            if terminal_gaps:
+                positions = ", ".join(str(g["start_column"]) if g["start_column"] == g["end_column"]
+                                      else f"{g['start_column']}–{g['end_column']}" for g in terminal_gaps)
+                reasons.append(f"겹침 끝 {LOW_QUALITY_END_COLUMNS}개 정렬 열에 서로 떨어진 "
+                               f"저품질 Gap {len(terminal_gaps)}구간(정렬 위치 {positions})이 있고, "
+                               f"연결 경계에 미정렬 염기 {overlap['junction_unaligned']} bp가 남아 있습니다 "
+                               "(검증용 보정).")
+            else:
+                reasons.append(f"겹침 끝 {LOW_QUALITY_END_COLUMNS}개 정렬 열에 저품질 Gap과 "
+                               "염기 불일치가 함께 있고, 연결 경계의 미정렬 염기도 남아 있습니다 "
+                               "(검증용 보정).")
     evidence = long_overlap_evidence(overlap)
     if reasons and evidence["accepted"]:
         return {"label": "Contig 생성", "state": "joined", "generated": True,
@@ -798,8 +842,9 @@ def render_result(rows, reads):
             "있는 경우에만 해당 예외를 적용합니다. "
             f"짧은 말단 제외({MAX_CORE_TRIM_COLUMNS}개 열 이내)의 대체 정렬은 Q30 이상 충돌을 "
             "숨기지 않는 경우에 한해 평가합니다. "
-            f"말단 {LOW_QUALITY_END_COLUMNS}개 열에 저품질 Gap·염기 불일치와 미정렬 연결 경계가 "
-            "함께 남는 경우는 Contig2로 예측합니다. "
+            f"말단 {LOW_QUALITY_END_COLUMNS}개 열에 저품질 Gap·염기 불일치가 함께 있거나 "
+            "서로 떨어진 저품질 Gap이 두 구간 이상 있고, 미정렬 연결 경계도 남으면 "
+            "Contig2로 예측합니다. 연속 Gap은 한 구간으로 셉니다. "
             f"긴 저품질 겹침 보정: 겹침 {MAX_SHORT_GAP_PAIR_BASES} bp 초과이고 양쪽 Q20 "
             f"지지 비중이 {LONG_OVERLAP_MAX_Q20_FRACTION:.0%} 미만이면 별도 기준을 검사합니다. "
             f"일치율 {LONG_OVERLAP_MIN_IDENTITY:g}% 이상, 정렬 점수 {LONG_OVERLAP_MIN_SCORE:g} 이상, "
@@ -848,7 +893,7 @@ def main():
         "version": APP_VERSION, "hashes": [sha256(data) for data in upload_bytes],
         "names": [f_upload.name, r_upload.name] if ready else [],
     }, sort_keys=True).encode())
-    result_key = "ab1_comparison_v9"
+    result_key = "ab1_comparison_v10"
     clicked = st.button("Contig 분석", type="primary", disabled=not ready, key="analyze_button")
     if clicked:
         st.session_state.pop(result_key, None)
