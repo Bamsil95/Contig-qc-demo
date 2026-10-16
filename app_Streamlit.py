@@ -22,7 +22,7 @@ from Bio import SeqIO
 from Bio.Align import PairwiseAligner
 from Bio.Seq import Seq
 
-APP_VERSION = "2026.10.15-ab1-v11"
+APP_VERSION = "2026.10.16-ab1-v12"
 MAX_READ_BASES = 5000
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MIN_READ_BASES = 50
@@ -236,6 +236,45 @@ def opposing_gap_pair_evidence(events, q20_agreements):
             "between_columns": right - left - 1, "between_q20_run": longest}
 
 
+def persistent_weak_terminal_gap(overlap):
+    """보수적 비교에도 남는 반대 방향 Gap 쌍의 약한 말단 지지를 확인한다.
+
+    짧은 연결에 Q20 이상 Gap 하나와 Q20 미만 Gap 하나가 함께 있고,
+    같은 read 좌표의 두 Gap이 보수적 정렬에도 유지되는 경우만 검사한다.
+    저품질 Gap 바깥의 짧은 말단에서 연속 Q20 지지가 부족한 패턴이다.
+    실제 출력 비교를 근거로 기존 길이·말단·연속 지지 범위를 재사용한
+    경험적 보정이며 실제 조립기의 내부 판정 규칙을 재현한 것은 아니다.
+    """
+    if not overlap or overlap["paired_bases"] > MAX_SHORT_GAP_PAIR_BASES:
+        return None
+    pair, core = overlap.get("opposing_gap_pair"), overlap.get("core_alignment")
+    if (not pair or pair["q20_gap_count"] != 1 or not core
+            or overlap["connection"] not in ("F → R", "R → F")
+            or core["connection"] != overlap["connection"]
+            or core["reverse_orientation"] != overlap["reverse_orientation"]):
+        return None
+    core_pair = core.get("opposing_gap_pair")
+    if not core_pair or core_pair["q20_gap_count"] != 1:
+        return None
+    gaps = [e for e in core["events"] if e["kind"] in ("F Gap", "R Gap")]
+    original = [e for e in overlap["events"] if e["kind"] in ("F Gap", "R Gap")]
+    def signature(event):
+        return tuple(event[key] for key in ("kind", "f_position", "r_position", "support_q"))
+
+    if sorted(map(signature, gaps)) != sorted(map(signature, original)):
+        return None
+    low = next(e for e in gaps if e["support_q"] < 20)
+    left = low["column"] == min(e["column"] for e in gaps)
+    outer_columns = low["column"] - 1 if left else len(core["markers"]) - low["column"]
+    anchor = core["gap_outer_q20_anchors"]["left" if left else "right"]
+    if outer_columns > LOW_QUALITY_END_COLUMNS or anchor >= MIN_GAP_PAIR_OUTER_Q20:
+        return None
+    return {"low_gap_support_q": low["support_q"], "low_gap_core_column": low["column"],
+            "outer_columns": outer_columns, "outer_q20_run": anchor,
+            "between_q20_run": core_pair["between_q20_run"],
+            "core_paired_bases": core["paired_bases"], "core_gaps": core["gaps"]}
+
+
 def short_gap_pair_reasons(overlap):
     """짧은 연결에서 저품질 gap을 포함한 반대 방향 쌍을 검토한다.
 
@@ -254,6 +293,13 @@ def short_gap_pair_reasons(overlap):
         return ["짧은 겹침에 Q20 이상 Gap과 저품질 Gap이 반대 방향으로 있으며, "
                 f"두 Gap 사이의 연속 Q20 일치가 {pair['between_q20_run']} bp로 "
                 f"기준 {MIN_MIXED_GAP_Q20_RUN} bp 미만입니다 (검증용 보정)."]
+    terminal = persistent_weak_terminal_gap(overlap)
+    if terminal:
+        return ["보수적 비교에도 Q20 이상 Gap과 저품질 Gap이 반대 방향으로 남습니다. "
+                f"저품질 Gap의 지지 Q는 {terminal['low_gap_support_q']}이고, "
+                f"그 바깥 말단 {terminal['outer_columns']}개 정렬 열에서 연속 Q20 일치는 "
+                f"{terminal['outer_q20_run']} bp로 기준 {MIN_GAP_PAIR_OUTER_Q20} bp 미만입니다 "
+                "(검증용 보정)."]
     return []
 
 
@@ -757,6 +803,7 @@ def summary_rows(rows):
         prediction = row["prediction"]
         evidence = long_overlap_evidence(row["overlap"])
         extension = unsupported_terminal_extension(row["overlap"])
+        terminal = persistent_weak_terminal_gap(row["overlap"])
         records.append({
             "조건": row["condition"]["label"], "예측 결과": prediction["label"],
             "Contig 생성 예측": "생성" if prediction["generated"] else "생성 안 됨",
@@ -785,6 +832,9 @@ def summary_rows(rows):
             "품질 지지 없는 말단 확장 검사": extension is not None,
             "품질 지지 없는 확장 정렬 열": extension["extension_columns"] if extension else 0,
             "해당 확장의 추가 Q20 일치 (bp)": extension["additional_q20_matches"] if extension else None,
+            "보수적 정렬의 약한 말단 Gap 검사": terminal is not None,
+            "해당 말단 Gap 지지 Q": terminal["low_gap_support_q"] if terminal else None,
+            "해당 Gap 바깥 연속 Q20 일치 (bp)": terminal["outer_q20_run"] if terminal else None,
             "국소 Q20 충돌 최대 개수": overlap.get("conflict_cluster", {}).get("count", 0),
             "국소 충돌 구간 시작 (정렬 위치)": overlap.get("conflict_cluster", {}).get("start_column"),
             "국소 충돌 구간 끝 (정렬 위치)": overlap.get("conflict_cluster", {}).get("end_column"),
@@ -814,6 +864,7 @@ def quality_summary(reads):
 
 def render_result(rows, reads):
     st.subheader("Contig 생성 예측")
+    st.caption("F/R 조립 가능성에 대한 예측입니다. BLAST 동정 결과는 별도로 확인해 주세요.")
     joined = [row["condition"]["label"] for row in rows if row["prediction"]["generated"]]
     if joined:
         st.success("생성 예상 조건: " + ", ".join(joined))
