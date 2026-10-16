@@ -22,7 +22,7 @@ from Bio import SeqIO
 from Bio.Align import PairwiseAligner
 from Bio.Seq import Seq
 
-APP_VERSION = "2026.10.14-ab1-v10"
+APP_VERSION = "2026.10.15-ab1-v11"
 MAX_READ_BASES = 5000
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MIN_READ_BASES = 50
@@ -477,6 +477,70 @@ def unresolved_low_quality_end(overlap):
     return False
 
 
+def unsupported_terminal_extension(overlap):
+    """짧은 겹침에서 품질 지지 없이 Gap만 늘리는 말단 확장을 찾는다.
+
+    보수적 정렬의 서열·좌표가 원래 정렬 안에 있고 내부 차이가 유지될 때만 비교한다.
+    제외되는 말단 차이는 모두 Q20 미만이어야 하며, 확장으로 양쪽 Q20
+    일치가 하나도 늘지 않고 연결 경계도 미정렬 상태일 때만 표시한다.
+    기존의 짧은 겹침·말단 검사 범위를 재사용한 경험적 검사다.
+    실제 조립기의 말단 처리 규칙을 재현하거나 염기를 다시 절단하지 않는다.
+    """
+    if not overlap:
+        return None
+    core = overlap.get("core_alignment")
+    if (not core or overlap["paired_bases"] > MAX_SHORT_GAP_PAIR_BASES
+            or overlap["connection"] not in ("F → R", "R → F")
+            or overlap["junction_unaligned"] == 0
+            or core["connection"] != overlap["connection"]
+            or core["reverse_orientation"] != overlap["reverse_orientation"]
+            or core["paired_bases"] < MIN_OVERLAP_BASES
+            or core["q20_matches"] < MIN_Q20_MATCHES
+            or core["q20_matches"] != overlap["q20_matches"]):
+        return None
+    removed = len(overlap["markers"]) - len(core["markers"])
+    if not 1 <= removed <= LOW_QUALITY_END_COLUMNS:
+        return None
+    for role, key in (("forward", "aligned_f"), ("reverse", "aligned_r")):
+        start, end = core[f"{role}_start"], core[f"{role}_end"]
+        if not overlap[f"{role}_start"] <= start <= end <= overlap[f"{role}_end"]:
+            return None
+        offset = start - overlap[f"{role}_start"]
+        if (overlap[key].replace("-", "")[offset:offset + end - start]
+                != core[key].replace("-", "")):
+            return None
+    # 정렬 열은 말단 제외에 따라 이동하므로 실제 read 좌표와 Q로 대조한다.
+    # 남은 Gap/불일치의 위치나 Q가 바뀌면 내부 재정렬로 보고 적용하지 않는다.
+    def signature(event):
+        return tuple(event[key] for key in ("kind", "f_position", "r_position", "support_q"))
+
+    original_events = [signature(e) for e in overlap["events"]]
+    core_events = [signature(e) for e in core["events"]]
+    if any(event not in original_events for event in core_events):
+        return None
+    excluded = [e for e in overlap["events"] if signature(e) not in core_events]
+    gaps = [e for e in excluded if e["kind"] in ("F Gap", "R Gap")]
+    if not gaps or any(e["support_q"] >= 20 for e in excluded):
+        return None
+    left = max(core[f"{role}_start"] - overlap[f"{role}_start"]
+               for role in ("forward", "reverse"))
+    right = max(overlap[f"{role}_end"] - core[f"{role}_end"]
+                for role in ("forward", "reverse"))
+    # 말단 반복 염기에서 Gap이 경계의 같은 염기로 한 칸 이동하는 경우를 포함한다.
+    # 그보다 내부의 차이가 사라지는 비교는 허용하지 않는다.
+    if not all((left > 0 and e["column"] <= left + 1)
+               or (right > 0 and e["column"] >= len(overlap["markers"]) - right)
+               for e in excluded):
+        return None
+    return {"extension_columns": removed,
+            "extension_paired_bases": overlap["paired_bases"] - core["paired_bases"],
+            "additional_q20_matches": 0,
+            "excluded_gap_columns": [e["column"] for e in gaps],
+            "excluded_gap_max_q": max(e["support_q"] for e in gaps),
+            "core_paired_bases": core["paired_bases"],
+            "core_gaps": core["gaps"]}
+
+
 def terminal_realign_supported(overlap):
     """실제 염기를 바꾸지 않고 짧은 말단만 제외한 대체 정렬의 제한적 인정.
 
@@ -613,6 +677,15 @@ def predict_contig(lengths, overlap, quality_bases=None):
         if overlap["longest_gap"] > MAX_GAP_RUN:
             reasons.append(f"연속 Gap이 {MAX_GAP_RUN} bp를 초과합니다.")
         reasons.extend(short_gap_pair_reasons(overlap))
+        extension = unsupported_terminal_extension(overlap)
+        if extension:
+            reasons.append(
+                f"보수적 비교보다 말단 {extension['extension_columns']}개 정렬 열을 확장했지만 "
+                "양쪽 Q20 이상 일치는 늘지 않았습니다. "
+                f"추가 Gap {len(extension['excluded_gap_columns'])}개 열의 지지 Q는 "
+                f"최대 {extension['excluded_gap_max_q']}이고, 연결 경계에 미정렬 염기 "
+                f"{overlap['junction_unaligned']} bp가 남아 있습니다 (검증용 보정)."
+            )
         if unresolved_low_quality_end(overlap):
             terminal_gaps = terminal_low_quality_gap_regions(overlap)
             if terminal_gaps:
@@ -683,6 +756,7 @@ def summary_rows(rows):
         overlap = row["overlap"] or {}
         prediction = row["prediction"]
         evidence = long_overlap_evidence(row["overlap"])
+        extension = unsupported_terminal_extension(row["overlap"])
         records.append({
             "조건": row["condition"]["label"], "예측 결과": prediction["label"],
             "Contig 생성 예측": "생성" if prediction["generated"] else "생성 안 됨",
@@ -708,6 +782,9 @@ def summary_rows(rows):
             "연결 경계 Q20 잔여 (bp)": overlap.get("junction_q20", 0),
             "말단 보수적 비교 겹침 (bp)": (overlap.get("core_alignment") or {}).get("paired_bases", 0),
             "말단 보수적 비교 Gap (bp)": (overlap.get("core_alignment") or {}).get("gaps", 0),
+            "품질 지지 없는 말단 확장 검사": extension is not None,
+            "품질 지지 없는 확장 정렬 열": extension["extension_columns"] if extension else 0,
+            "해당 확장의 추가 Q20 일치 (bp)": extension["additional_q20_matches"] if extension else None,
             "국소 Q20 충돌 최대 개수": overlap.get("conflict_cluster", {}).get("count", 0),
             "국소 충돌 구간 시작 (정렬 위치)": overlap.get("conflict_cluster", {}).get("start_column"),
             "국소 충돌 구간 끝 (정렬 위치)": overlap.get("conflict_cluster", {}).get("end_column"),
@@ -758,11 +835,12 @@ def render_result(rows, reads):
                 st.write(f"F **{row['lengths'][0]} bp** · R **{row['lengths'][1]} bp**")
                 overlap = row["overlap"]
                 if overlap:
-                    st.write(f"겹침 **{overlap['paired_bases']} bp** · 일치율 **{overlap['gap_identity']:.1f}%**")
+                    st.write(f"모델 겹침 **{overlap['paired_bases']} bp** · 일치율 **{overlap['gap_identity']:.1f}%**")
                 else:
                     st.write("겹침 없음")
 
     with st.expander("판정 근거·정렬 상세", expanded=False):
+        st.caption("겹침·일치율은 모델 정렬에서 계산한 값이며 실제 조립 출력의 사용 구간과 다를 수 있습니다.")
         selected = st.selectbox("상세 조건", [c.label for c in CONDITIONS], key="details_condition")
         row = next(row for row in rows if row["condition"]["label"] == selected)
         st.write("**" + row["prediction"]["label"] + " 예측 근거**")
