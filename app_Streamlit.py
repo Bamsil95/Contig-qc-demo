@@ -22,19 +22,13 @@ from Bio import SeqIO
 from Bio.Align import PairwiseAligner
 from Bio.Seq import Seq
 
-APP_VERSION = "2026.10.19-ab1-v13"
+APP_VERSION = "2026.10.19-ab1-v14"
 RERUN_RULE_VERSION = "quality-review-v1"
 # 재반응 전후 검증 전의 보수적 검토 기준. 성공 확률이나 사내 SOP가 아니다.
 RERUN_REFERENCE_FRACTION = 0.80
 RERUN_WEAK_FRACTION = 0.50
 RERUN_MIN_DIFFERENCES = 3
 RERUN_MIN_SUPPORTING_CONDITIONS = 2
-ACTUAL_RESULTS = {
-    "unknown": "아직 확인하지 않음",
-    "all_failed": "네 조건 모두 Contig2 또는 No contig",
-    "joined": "실제 Contig 생성 확인",
-    "no_blast": "No blast · 조립 결과는 미확인",
-}
 MAX_READ_BASES = 5000
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MIN_READ_BASES = 50
@@ -937,23 +931,20 @@ def rerun_profiles(reads, rows):
     return profiles
 
 
-def recommend_rerun(reads, rows, actual_result='unknown', final_qc_passed=False):
+def recommend_rerun(reads, rows):
     """재반응 전의 관측만으로 검토안을 만든다. 입력과 기존 Contig 판정은 변경하지 않는다.
 
     실제 재반응 효과는 미검증이다. Q를 가상으로 올리거나 서열을 수정하지 않는다.
-    '불필요'는 사용자가 실제 조립 및 최종 QC 통과를 확인한 경우에만 허용한다.
+    실제 결과 입력 없이 AB1만으로 검토하며, 재반응 불필요를 확정하지 않는다.
     """
     if len(reads) != 2 or len(rows) != len(CONDITIONS):
         raise ValueError('F/R 두 파일과 네 조건의 분석 결과가 필요합니다.')
-    if actual_result not in ACTUAL_RESULTS:
-        raise ValueError('지원하지 않는 실제 조립 결과입니다.')
     profiles = rerun_profiles(reads, rows)
     local = [direction_quality_evidence(reads, row) for row in rows]
     local = [item for item in local if item is not None]
     joined = [row['condition']['label'] for row in rows if row['prediction']['generated']]
     result = {
-        'rule_version': RERUN_RULE_VERSION, 'actual_result': actual_result,
-        'final_qc_passed': bool(final_qc_passed and actual_result == 'joined'),
+        'rule_version': RERUN_RULE_VERSION,
         'profiles': profiles, 'local_evidence': local, 'predicted_joined_conditions': joined,
         'validation': '재반응 효과 미검증 · 서열과 Quality에 근거한 검토안',
         'thresholds': {'reference_q20_fraction': RERUN_REFERENCE_FRACTION,
@@ -967,21 +958,6 @@ def recommend_rerun(reads, rows, actual_result='unknown', final_qc_passed=False)
                       evidence_type=evidence_type)
         return result
 
-    if actual_result == 'joined':
-        if result['final_qc_passed']:
-            result['validation'] = '사용자 입력: 실제 조립 및 최종 품질 통과 확인'
-            return finish('no_rerun', '추가 재반응 불필요 · 실제 결과 확인',
-                          ['실제 Contig 생성과 최종 품질 기준 통과를 확인했다고 입력했습니다.'],
-                          '확인한 결과와 사용 조건을 기존 업무 기록에 남겨 주세요.', '실제 결과 확인')
-        return finish('existing_qc', '기존 Contig의 최종 품질 확인 우선',
-                      ['실제 Contig 생성은 확인되었지만 최종 품질 통과는 아직 확인되지 않았습니다.'],
-                      '서열 품질·필요 구간·동정 결과를 업무 기준에 맞게 확인해 주세요.', '실제 조립 확인')
-    if actual_result == 'all_failed' and joined:
-        return finish('prediction_mismatch', '실제 결과와 예측 불일치 · 판단 보류',
-                      ['실제로 네 조건 모두 생성되지 않았다고 입력했지만, '
-                       + ', '.join(joined) + ' 조건은 생성으로 예측되었습니다.'],
-                      '입력 파일과 조건을 확인하고 실제 출력과 함께 검토해 주세요. '
-                      '이 예측을 근거로 재반응을 생략하지 마세요.', '조립 결과 불일치')
     if joined:
         return finish('recheck_existing', '기존 데이터 재검토 우선',
                       [', '.join(joined) + ' 조건에서 Contig 생성이 예상됩니다.',
@@ -1117,49 +1093,121 @@ def plain_prediction_reasons(row):
 
 def review_export(rows, review):
     records = summary_rows(rows)
+    display = rerun_display(review)
     for record, row in zip(records, rows):
         record.update({'쉬운 판정 설명': ' / '.join(plain_prediction_reasons(row)),
-                       '재반응 검토': review['label'], '재반응 판정 코드': review['code'],
+                       '재반응 검토': display['headline'], '재반응 판정 코드': review['code'],
+                       'F 방향 안내': display['directions'][0]['status'],
+                       'R 방향 안내': display['directions'][1]['status'],
+                       '검토할 조합': display['combination'],
                        '재반응 근거': ' / '.join(review['reasons']),
                        '다음 확인 사항': review['next_step'], '검증 상태': review['validation'],
-                       '실제 조립 결과(사용자 입력)': ACTUAL_RESULTS[review['actual_result']],
-                       '최종 품질 통과(사용자 입력)': review['final_qc_passed'],
                        '재반응 기준 버전': review['rule_version']})
         for p in review['profiles']:
             record[p['direction'] + ' 파일 SHA256'] = p['source_sha256']
     return records
 
 
-def render_rerun_review(rows, reads):
-    st.subheader("재반응 검토")
-    st.caption("현재 서열과 Quality로 검토 방향을 제안합니다. 실제 재반응의 성공률은 아직 검증되지 않았습니다.")
-    identity = sha256(json.dumps([
-        (r.file_name, r.source_sha256 or sha256((r.sequence + str(r.qualities)).encode()))
-        for r in reads
-    ], ensure_ascii=False).encode())[:20]
-    with st.expander("실제 결과를 알고 있다면 입력해 주세요", expanded=False):
-        actual = st.selectbox("실제 조립 결과", list(ACTUAL_RESULTS),
-                              format_func=ACTUAL_RESULTS.get, key="actual_" + identity)
-        qc = False
-        if actual == 'joined':
-            qc = st.checkbox("실제 Contig가 최종 품질·필요 구간·동정 기준을 모두 통과했습니다",
-                             key="qc_" + identity)
-        st.caption("입력은 현재 파일의 검토와 다운로드에만 반영됩니다. 예측 규칙을 자동으로 학습하거나 바꾸지 않습니다.")
-        if actual == 'no_blast':
-            st.info("No blast만으로 조립 실패를 확정하지 않습니다. 실제 Contig 생성 여부를 별도로 확인해 주세요.")
-    review = recommend_rerun(reads, rows, actual, qc)
-    if review['code'] == 'no_rerun':
-        st.success(review['label'])
-    elif review['code'] in ('f_only', 'r_only', 'both', 'prediction_mismatch'):
-        st.warning(review['label'])
+def rerun_display(review):
+    """판정 코드를 F/R별 조치와 다음 조합으로 풀어 쓴다. 판단 기준은 바꾸지 않는다."""
+    code = review['code']
+    if code in ('f_only', 'r_only'):
+        target, other = ('F', 'R') if code == 'f_only' else ('R', 'F')
+        weak_reason = ('네 조건 모두 연결에 사용할 염기가 부족합니다.'
+                       if review['evidence_type'] == '한쪽 유효 서열 부족'
+                       else '겹침 구간에서 이 방향의 품질이 낮은 차이가 반복됩니다.')
+        return {
+            'headline': target + ' 우선 재반응 검토',
+            'summary': f'{target}의 품질을 보완하는 방향부터 검토해 보세요.',
+            'combination': f'새 {target} + 기존 {other}',
+            'next_action': f'{target}만 재반응한다면, 새 {target}을 기존 {other}과 조립해 확인합니다.',
+            'check': f'기존 {other}이 필요한 서열 구간을 충분히 읽었는지 먼저 확인해 주세요.',
+            'directions': [
+                {'role': role, 'status': '우선 재반응 후보' if role == target else '기존 파일 활용 검토',
+                 'emphasis': role == target,
+                 'reason': weak_reason if role == target else
+                           '추천 근거가 되는 구간의 품질이 상대적으로 높습니다. 필요한 구간의 확보 여부는 확인이 필요합니다.'}
+                for role in ('F', 'R')],
+        }
+    if code == 'both':
+        reason = ('네 조건 모두 연결에 사용할 염기가 부족합니다.'
+                  if review['evidence_type'] == '양쪽 유효 서열 부족'
+                  else '연결 구간에서 품질이 낮은 부분이 많습니다.')
+        return {
+            'headline': 'F + R 양방향 재반응 검토',
+            'summary': '현재는 한쪽만 보완하는 방향을 제안하기 어렵습니다.',
+            'combination': '새 F + 새 R',
+            'next_action': '양쪽 파형과 시료 상태를 확인한 뒤, 두 방향의 재반응을 검토합니다.',
+            'check': '시료·정제 문제가 있다면 같은 반응을 반복하기 전에 그 원인부터 조치해 주세요.',
+            'directions': [{'role': role, 'status': '재반응 검토 대상', 'emphasis': True,
+                            'reason': reason} for role in ('F', 'R')],
+        }
+    if code == 'recheck_existing':
+        conditions = ', '.join(review['predicted_joined_conditions'])
+        return {
+            'headline': '재반응 전 기존 데이터로 조립 확인',
+            'summary': f'{conditions} 조건에서 연결이 예상됩니다. 먼저 현재 파일로 실제 조립 결과를 확인해 보세요.',
+            'combination': '기존 F + 기존 R',
+            'next_action': f'{conditions} 조건으로 조립하고, 생성된 결과의 최종 품질을 확인합니다.',
+            'check': '실제로 모든 조건에서 Contig2가 나왔다면 예측과 다른 사례입니다. 이 안내만으로 재반응을 생략하지 마세요.',
+            'directions': [{'role': role, 'status': '현재 파일로 조립 확인', 'emphasis': False,
+                            'reason': '기존 F/R 조합에서 연결 가능성이 예측되었습니다.'} for role in ('F', 'R')],
+        }
+    if code == 'trace_review':
+        return {
+            'headline': '재반응 전 양쪽 파형 확인',
+            'summary': '품질이 높은 구간에서도 F와 R의 결과가 달라, 어느 쪽을 다시 해야 할지 고르기 어렵습니다.',
+            'combination': '재반응 방향 선택 보류',
+            'next_action': '정렬 상세의 ‘원본 파형에서 확인할 위치’를 열어 F와 R을 함께 확인합니다.',
+            'check': '샘플 짝·프라이머·시료 상태도 확인해 주세요. 정렬 차이만으로 혼합이나 삽입·결실을 확정하지 않습니다.',
+            'directions': [{'role': role, 'status': '차이 난 위치 확인', 'emphasis': False,
+                            'reason': '반대 방향과 다르게 읽힌 위치의 원본 파형을 확인해야 합니다.'} for role in ('F', 'R')],
+        }
+    if review['evidence_type'] == '겹침 부족':
+        summary = '연결 구간이 부족해 어느 방향을 보완해야 할지 비교하기 어렵습니다.'
+        check = '프라이머가 읽는 구간과 샘플 짝을 먼저 확인해 주세요.'
+    elif review['evidence_type'] == '방향 근거 불일치':
+        summary = '조건에 따라 품질이 약한 방향이 달라, F 또는 R을 우선 선택하기 어렵습니다.'
+        check = '조건별 겹침 위치와 양쪽 원본 파형을 함께 확인해 주세요.'
     else:
-        st.info(review['label'])
-    for reason in review['reasons']:
-        st.write("• " + reason)
-    st.write("**다음 확인:** " + review['next_step'])
-    st.caption(review['validation'])
+        summary = '한쪽만 다시 하면 해결될 것으로 제안할 만큼 방향별 품질 차이가 뚜렷하지 않습니다.'
+        check = '겹침 끝과 차이가 난 위치의 파형을 확인해 주세요. 양방향 재반응이 꼭 필요하다는 뜻도 아닙니다.'
+    return {
+        'headline': 'F/R 중 재반응 방향 선택 어려움', 'summary': summary,
+        'combination': '재반응 방향 선택 보류',
+        'next_action': '판정 근거와 원본 파형을 확인한 뒤 재반응 방향을 결정합니다.',
+        'check': check,
+        'directions': [{'role': role, 'status': '우선순위 판단 보류', 'emphasis': False,
+                        'reason': '현재 자료로는 이 방향을 다시 했을 때의 이점을 구분하기 어렵습니다.'}
+                       for role in ('F', 'R')],
+    }
 
-    with st.expander("추천에 사용한 F/R 품질 비교", expanded=False):
+
+def render_rerun_review(rows, reads):
+    st.subheader("어느 방향을 다시 반응할까요?")
+    review = recommend_rerun(reads, rows)
+    display = rerun_display(review)
+    st.markdown('### ' + display['headline'])
+    st.write(display['summary'])
+    for column, direction in zip(st.columns(2), display['directions']):
+        role = direction['role']
+        profile = next(p for p in review['profiles'] if p['direction'] == role)
+        with column, st.container(border=True):
+            st.markdown('### ' + role + ' 방향')
+            if direction['emphasis']:
+                st.warning('● ' + direction['status'])
+            else:
+                st.info(direction['status'])
+            st.write(direction['reason'])
+            st.caption(profile['file_name'])
+    st.write('**검토할 조합: ' + display['combination'] + '**')
+    st.write(display['next_action'])
+    st.write('**반응 전에 확인:** ' + display['check'])
+    st.caption('현재 서열·품질로 제안한 검토안입니다. 재반응 후 실제로 개선되는지는 아직 검증 중입니다.')
+
+    with st.expander("왜 이렇게 안내했나요? · 근거와 F/R 품질 비교", expanded=False):
+        for reason in review['reasons']:
+            st.write('• ' + reason)
         for column, profile in zip(st.columns(2), review['profiles']):
             with column:
                 st.write("**" + profile['direction'] + " 방향**")
@@ -1229,6 +1277,8 @@ def original_event_positions(row):
 
 
 def render_result(rows, reads):
+    review = render_rerun_review(rows, reads)
+    st.divider()
     st.subheader("Contig 생성 예측")
     st.caption("F/R 조립 가능성에 대한 예측입니다. BLAST 동정 결과는 별도로 확인해 주세요.")
     joined = [row["condition"]["label"] for row in rows if row["prediction"]["generated"]]
@@ -1256,7 +1306,6 @@ def render_result(rows, reads):
                 else:
                     st.write("비교할 겹침을 찾지 못했습니다.")
 
-    review = render_rerun_review(rows, reads)
     with st.expander("판정 근거 · 쉽게 보기", expanded=False):
         selected = st.selectbox("설명할 조건", [c.label for c in CONDITIONS], key="details_condition")
         row = next(row for row in rows if row["condition"]["label"] == selected)
@@ -1346,9 +1395,9 @@ def render_result(rows, reads):
     st.download_button("분석·재반응 검토 결과 다운로드 (CSV)",
                        pd.DataFrame(review_export(rows, review)).to_csv(index=False).encode("utf-8-sig"),
                        file_name="contig_prediction.csv", mime="text/csv", key="result_download")
-    snapshot = {'schema_version': 1, 'app_version': APP_VERSION,
-                'recommendation': review, 'conditions': rows,
-                'note': '실제 결과와 QC는 사용자 입력입니다. 재반응 효과를 검증한 기록이 아닙니다.'}
+    snapshot = {'schema_version': 2, 'app_version': APP_VERSION,
+                'recommendation': review, 'display': rerun_display(review), 'conditions': rows,
+                'note': 'AB1의 서열·품질에 근거한 검토 기록입니다. 실제 재반응 효과를 검증한 기록은 아닙니다.'}
     st.download_button("후속 비교용 분석 기록 다운로드 (JSON)",
                        json.dumps(snapshot, ensure_ascii=False, indent=2).encode('utf-8'),
                        file_name="contig_review_record.json", mime="application/json", key="review_download")
