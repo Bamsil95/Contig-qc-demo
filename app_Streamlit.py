@@ -22,7 +22,19 @@ from Bio import SeqIO
 from Bio.Align import PairwiseAligner
 from Bio.Seq import Seq
 
-APP_VERSION = "2026.10.16-ab1-v12"
+APP_VERSION = "2026.10.19-ab1-v13"
+RERUN_RULE_VERSION = "quality-review-v1"
+# 재반응 전후 검증 전의 보수적 검토 기준. 성공 확률이나 사내 SOP가 아니다.
+RERUN_REFERENCE_FRACTION = 0.80
+RERUN_WEAK_FRACTION = 0.50
+RERUN_MIN_DIFFERENCES = 3
+RERUN_MIN_SUPPORTING_CONDITIONS = 2
+ACTUAL_RESULTS = {
+    "unknown": "아직 확인하지 않음",
+    "all_failed": "네 조건 모두 Contig2 또는 No contig",
+    "joined": "실제 Contig 생성 확인",
+    "no_blast": "No blast · 조립 결과는 미확인",
+}
 MAX_READ_BASES = 5000
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MIN_READ_BASES = 50
@@ -862,6 +874,360 @@ def quality_summary(reads):
     } for r in reads])
 
 
+def direction_quality_evidence(reads, row):
+    """실제 정렬의 각 염기 Q를 방향별로 센다. Gap 방향은 오류 방향으로 쓰지 않는다.
+
+    R의 Q 배열도 서열과 함께 뒤집는다. 겹침 안의 염기 불일치에서만
+    저품질 쪽 / Q30 이상 반대쪽이라는 비대칭 근거를 센다.
+    동일 read의 네 조건은 독립된 표본이나 성공 확률 근거가 아니다.
+    """
+    overlap = row['overlap']
+    if overlap is None:
+        return None
+    condition = Condition(**row['condition'])
+    f, r = [trim_read(read, condition)[0] for read in reads]
+    rq = r.qualities[::-1] if overlap['reverse_orientation'] == 'Reverse complement' else r.qualities
+    cursors = [overlap['forward_start'], overlap['reverse_start']]
+    qualities = [f.qualities, rq]
+    evidence = {role: {'bases': 0, 'q20': 0, 'weak_differences': 0}
+                for role in ('F', 'R')}
+    for fb, rb in zip(overlap['aligned_f'], overlap['aligned_r']):
+        bases = (fb, rb)
+        qs = [qualities[i][cursors[i]] if base != '-' else None
+              for i, base in enumerate(bases)]
+        for i, role in enumerate(('F', 'R')):
+            if bases[i] != '-':
+                evidence[role]['bases'] += 1
+                evidence[role]['q20'] += int(bases[i] in 'ACGT' and qs[i] >= 20)
+                cursors[i] += 1
+        # 빈칸의 위치만으로 어느 방향의 측정이 잘못됐는지 판단하지 않는다.
+        if '-' in bases or (fb == rb and fb in 'ACGT'):
+            continue
+        for i, role in enumerate(('F', 'R')):
+            j = 1 - i
+            if ((qs[i] < 20 or bases[i] not in 'ACGT')
+                    and qs[j] >= 30 and bases[j] in 'ACGT'):
+                evidence[role]['weak_differences'] += 1
+    for values in evidence.values():
+        values['q20_fraction'] = values['q20'] / values['bases'] if values['bases'] else 0.0
+    return {'condition': row['condition']['label'], 'directions': evidence,
+            'paired_bases': overlap['paired_bases'], 'connection': overlap['connection'],
+            'high_quality_conflicts': overlap['q20_base_conflicts'],
+            'q20_gap_regions': overlap['q20_gap_regions']}
+
+
+def rerun_profiles(reads, rows):
+    profiles = []
+    for i, role in enumerate(('F', 'R')):
+        read = reads[i]
+        valid = [base in 'ACGT' and q >= 20 for base, q in zip(read.sequence, read.qualities)]
+        longest = current = 0
+        for accepted in valid:
+            current = current + 1 if accepted else 0
+            longest = max(longest, current)
+        fractions = [row['quality_bases'][i] / row['lengths'][i] for row in rows
+                     if row['lengths'][i] >= MIN_READ_BASES
+                     and row['quality_bases'][i] >= MIN_Q20_READ_BASES]
+        profiles.append({'direction': role, 'file_name': read.file_name,
+                         'source_sha256': read.source_sha256,
+                         'original_bases': len(read.sequence), 'original_q20': sum(valid),
+                         'longest_continuous_q20': longest,
+                         'max_retained_q20': max(row['quality_bases'][i] for row in rows),
+                         'best_retained_q20_fraction': max(fractions, default=0.0)})
+    return profiles
+
+
+def recommend_rerun(reads, rows, actual_result='unknown', final_qc_passed=False):
+    """재반응 전의 관측만으로 검토안을 만든다. 입력과 기존 Contig 판정은 변경하지 않는다.
+
+    실제 재반응 효과는 미검증이다. Q를 가상으로 올리거나 서열을 수정하지 않는다.
+    '불필요'는 사용자가 실제 조립 및 최종 QC 통과를 확인한 경우에만 허용한다.
+    """
+    if len(reads) != 2 or len(rows) != len(CONDITIONS):
+        raise ValueError('F/R 두 파일과 네 조건의 분석 결과가 필요합니다.')
+    if actual_result not in ACTUAL_RESULTS:
+        raise ValueError('지원하지 않는 실제 조립 결과입니다.')
+    profiles = rerun_profiles(reads, rows)
+    local = [direction_quality_evidence(reads, row) for row in rows]
+    local = [item for item in local if item is not None]
+    joined = [row['condition']['label'] for row in rows if row['prediction']['generated']]
+    result = {
+        'rule_version': RERUN_RULE_VERSION, 'actual_result': actual_result,
+        'final_qc_passed': bool(final_qc_passed and actual_result == 'joined'),
+        'profiles': profiles, 'local_evidence': local, 'predicted_joined_conditions': joined,
+        'validation': '재반응 효과 미검증 · 서열과 Quality에 근거한 검토안',
+        'thresholds': {'reference_q20_fraction': RERUN_REFERENCE_FRACTION,
+                       'weak_q20_fraction': RERUN_WEAK_FRACTION,
+                       'min_asymmetric_differences': RERUN_MIN_DIFFERENCES,
+                       'min_supporting_conditions': RERUN_MIN_SUPPORTING_CONDITIONS},
+    }
+
+    def finish(code, label, reasons, next_step, evidence_type):
+        result.update(code=code, label=label, reasons=reasons, next_step=next_step,
+                      evidence_type=evidence_type)
+        return result
+
+    if actual_result == 'joined':
+        if result['final_qc_passed']:
+            result['validation'] = '사용자 입력: 실제 조립 및 최종 품질 통과 확인'
+            return finish('no_rerun', '추가 재반응 불필요 · 실제 결과 확인',
+                          ['실제 Contig 생성과 최종 품질 기준 통과를 확인했다고 입력했습니다.'],
+                          '확인한 결과와 사용 조건을 기존 업무 기록에 남겨 주세요.', '실제 결과 확인')
+        return finish('existing_qc', '기존 Contig의 최종 품질 확인 우선',
+                      ['실제 Contig 생성은 확인되었지만 최종 품질 통과는 아직 확인되지 않았습니다.'],
+                      '서열 품질·필요 구간·동정 결과를 업무 기준에 맞게 확인해 주세요.', '실제 조립 확인')
+    if actual_result == 'all_failed' and joined:
+        return finish('prediction_mismatch', '실제 결과와 예측 불일치 · 판단 보류',
+                      ['실제로 네 조건 모두 생성되지 않았다고 입력했지만, '
+                       + ', '.join(joined) + ' 조건은 생성으로 예측되었습니다.'],
+                      '입력 파일과 조건을 확인하고 실제 출력과 함께 검토해 주세요. '
+                      '이 예측을 근거로 재반응을 생략하지 마세요.', '조립 결과 불일치')
+    if joined:
+        return finish('recheck_existing', '기존 데이터 재검토 우선',
+                      [', '.join(joined) + ' 조건에서 Contig 생성이 예상됩니다.',
+                       '생성 예측만으로 재반응 불필요를 확정하지 않습니다.'],
+                      '해당 조건으로 실제 조립한 뒤 최종 품질 기준을 확인해 주세요.', '생성 예상 조건 있음')
+
+    insufficient = [p['max_retained_q20'] < MIN_Q20_READ_BASES for p in profiles]
+    if all(insufficient):
+        return finish('both', 'F/R 양방향 재반응 검토',
+                      [f"네 조건 중 가장 많이 남긴 경우에도 Q20 이상 염기가 F {profiles[0]['max_retained_q20']} bp, "
+                       f"R {profiles[1]['max_retained_q20']} bp로, 두 방향 모두 최소 {MIN_Q20_READ_BASES} bp에 못 미칩니다."],
+                      '양쪽 파형과 시료 상태를 먼저 확인해 주세요. 시료·정제 문제가 있으면 그 원인부터 조치해야 합니다.',
+                      '양쪽 유효 서열 부족')
+    # 품질이 높은 양쪽 자료가 반복해서 다르면 낮은 평균 Q만으로 방향을 고르지 않는다.
+    conflicting = [x['condition'] for x in local
+                   if x['paired_bases'] >= MIN_OVERLAP_BASES
+                   and (x['high_quality_conflicts'] >= RERUN_MIN_DIFFERENCES
+                        or min(x['q20_gap_regions'].values()) >= MIN_BIDIRECTIONAL_GAP_REGIONS)]
+    if len(conflicting) >= RERUN_MIN_SUPPORTING_CONDITIONS:
+        return finish('trace_review', '파형·시료 확인 우선',
+                      [', '.join(conflicting) + ' 조건에서 품질이 뒷받침되는 서열 차이가 반복됩니다.',
+                       '어느 한쪽이 잘못 읽혔다고 정렬만으로 정할 수 없습니다.'],
+                      '양쪽 원본 파형, 샘플 짝, 프라이머와 시료 상태를 확인해 주세요. '
+                      '정렬 차이만으로 Mix 또는 InDel을 확정하지 않습니다.', '양쪽 자료의 충돌')
+    if sum(insufficient) == 1:
+        weak = insufficient.index(True)
+        good = 1 - weak
+        if profiles[good]['best_retained_q20_fraction'] >= RERUN_REFERENCE_FRACTION:
+            role, other = profiles[weak]['direction'], profiles[good]['direction']
+            return finish(role.lower() + '_only', role + ' 우선 재반응 검토 · 단측 후보',
+                          [f"{role}은 네 조건 모두 Q20 이상 염기가 {MIN_Q20_READ_BASES} bp 미만입니다.",
+                           f"{other}은 이 최소 기준을 넘는 조건이 있고, 그중 품질이 가장 좋은 구간의 Q20 비중은 "
+                           f"{profiles[good]['best_retained_q20_fraction']:.0%}입니다."],
+                          f'기존 {other}이 필요한 구간을 충분히 읽었는지 확인한 후 {role} 단측을 검토해 주세요. '
+                          '재반응 후 길이 회복과 연결 성공은 아직 예측할 수 없습니다.', '한쪽 유효 서열 부족')
+
+    votes = {'F': [], 'R': []}
+    both_weak = []
+    for x in local:
+        if x['paired_bases'] < MIN_OVERLAP_BASES or x['connection'] not in ('F → R', 'R → F'):
+            continue
+        sides = x['directions']
+        for role, other in (('F', 'R'), ('R', 'F')):
+            if (sides[role]['q20_fraction'] < RERUN_WEAK_FRACTION
+                    and sides[other]['q20_fraction'] >= RERUN_REFERENCE_FRACTION
+                    and sides[role]['weak_differences'] >= RERUN_MIN_DIFFERENCES):
+                votes[role].append(x['condition'])
+        if all(sides[role]['q20_fraction'] < RERUN_WEAK_FRACTION for role in ('F', 'R')):
+            both_weak.append(x['condition'])
+    if votes['F'] and votes['R']:
+        return finish('hold', '판단 보류 · 조건별 방향 근거가 다름',
+                      ['조건에 따라 품질이 약한 방향이 달라 단측을 고르기 어렵습니다.'],
+                      '겹침 구간의 양쪽 파형을 함께 확인해 주세요.', '방향 근거 불일치')
+    for role, other in (('F', 'R'), ('R', 'F')):
+        if len(votes[role]) >= RERUN_MIN_SUPPORTING_CONDITIONS and not both_weak:
+            return finish(role.lower() + '_only', role + ' 우선 재반응 검토 · 단측 후보',
+                          [', '.join(votes[role]) + f' 조건에서 겹침 구간의 {role} 품질이 상대적으로 낮습니다.',
+                           f'각 조건에서 {role}의 Q20 비중은 {RERUN_WEAK_FRACTION:.0%} 미만, '
+                           f'{other}은 {RERUN_REFERENCE_FRACTION:.0%} 이상이며, '
+                           f'{role}이 낮은 품질이고 {other}이 Q30 이상인 서로 다른 염기 위치가 '
+                           f'{RERUN_MIN_DIFFERENCES}개 이상입니다.'],
+                          f'해당 위치의 파형과 기존 {other}의 필요 구간을 확인한 뒤 {role} 단측을 검토해 주세요. '
+                          '현재 품질 차이는 관찰되지만 재반응으로 개선될지는 아직 검증되지 않았습니다.',
+                          '겹침 구간의 방향별 품질 차이')
+    if len(both_weak) >= RERUN_MIN_SUPPORTING_CONDITIONS and not any(votes.values()):
+        return finish('both', 'F/R 양방향 재반응 검토',
+                      [', '.join(both_weak) + ' 조건의 겹침 구간에서 두 방향 모두 Q20 비중이 '
+                       f'{RERUN_WEAK_FRACTION:.0%} 미만입니다.'],
+                      '양쪽 파형과 시료 상태를 확인한 뒤 양방향을 검토해 주세요. '
+                      '연결에 필요한 길이가 확보될지, 다른 조치가 필요한지도 함께 확인해야 합니다.',
+                      '겹침 구간의 양쪽 품질 부족')
+    if not local or max(x['paired_bases'] for x in local) < MIN_OVERLAP_BASES:
+        return finish('hold', '판단 보류 · 연결 구간 근거 부족',
+                      ['방향별 품질을 비교할 만큼 충분한 겹침을 찾지 못했습니다.'],
+                      '프라이머·읽힌 구간·샘플 짝을 확인해 주세요. '
+                      '겹침 부족만으로 어느 방향을 반복해야 할지 정할 수 없습니다.', '겹침 부족')
+    return finish('hold', '판단 보류 · 단측 선택 근거 부족',
+                  ['한 방향만 바꾸면 해결될 것이라고 제안할 만큼 품질 차이가 명확하지 않습니다.'],
+                  '겹침 끝과 서열 차이가 있는 위치의 양쪽 파형을 확인해 주세요. '
+                  '현재 결과만으로 재반응 생략이나 양방향 재반응을 확정하지 않습니다.', '방향 특정 어려움')
+
+
+def plain_reason(reason, row):
+    """기존 판정 규칙을 바꾸지 않고 그 의미를 쉬운 문장으로 설명한다."""
+    o = row['overlap'] or {}
+    if '남은 서열이' in reason:
+        return '품질이 낮은 부분을 제외한 뒤 남은 서열이 너무 짧아 연결을 평가하기 어렵습니다. ' + reason
+    if 'Q20 이상 유효 염기가' in reason:
+        return reason.replace('Q20 이상 유효 염기', '품질 기준(Q20)을 넘는 A/C/G/T 염기')
+    if reason.startswith('연결에 필요한 겹침'):
+        return f"F와 R이 같은 구간을 읽은 부분이 {o.get('paired_bases', 0)} bp로 짧습니다. 현재 기준은 {MIN_OVERLAP_BASES} bp 이상입니다."
+    if reason.startswith('Gap 포함 일치율'):
+        return f"두 서열을 맞춰 보았을 때 같은 염기의 비율은 {o['gap_identity']:.1f}%로, 현재 기준 {MIN_GAP_IDENTITY:g}%에 못 미칩니다. 빈칸도 차이로 셉니다."
+    if reason.startswith('양쪽 Q20 이상 일치가'):
+        return f"두 방향 모두 품질이 좋고 같은 염기를 읽은 위치가 {o['q20_matches']}개로, 현재 기준 {MIN_Q20_MATCHES}개에 못 미칩니다."
+    if '충돌 비율이' in reason:
+        return '두 방향 모두 품질이 좋은데 서로 다른 결과를 보이는 비율이 허용 범위를 넘었습니다. 어느 쪽이 맞는지는 원본 파형 확인이 필요합니다.'
+    if '집중되어 있습니다' in reason:
+        c = o['conflict_cluster']
+        return f"짧은 구간에 품질이 뒷받침되는 차이 {c['count']}개가 몰려 있습니다. 전체 일치율이 높아도 이 구간 때문에 연결이 어려울 수 있습니다."
+    if reason.startswith('Q20으로 지지되는 Gap'):
+        return '두 서열의 글자 수가 맞지 않는 구간이 양쪽에 반복됩니다. 단순한 끝부분 품질 저하만으로 설명하기 어려워 연결을 보류했습니다.'
+    if reason.startswith('연결 경계에 정렬되지 않은'):
+        return f"서로 연결되어야 할 끝부분에 품질이 좋은 염기 {o['junction_q20']} bp가 대응되지 않고 남았습니다. 중간 일부만 비슷해도 전체 연결이 된 것은 아닙니다."
+    if reason.startswith('연속 Gap이'):
+        return f"두 서열의 길이를 맞추기 위해 넣은 빈칸이 연속 {o['longest_gap']}개로 깁니다. 이 차이를 확인해야 합니다."
+    if reason.startswith('보수적 비교에도 Q20 이상 Gap'):
+        t = persistent_weak_terminal_gap(o)
+        return f"짧은 연결 부위의 길이 차이가 다른 정렬 방식에서도 남습니다. 품질이 낮은 차이 바깥쪽에서 양쪽이 연속으로 잘 읽힌 부분은 {t['outer_q20_run']} bp뿐이라, 연결 끝을 충분히 뒷받침하지 못합니다."
+    if reason.startswith('보수적 비교보다 말단'):
+        return '겹치는 끝을 더 길게 잡아도 양쪽이 확실히 같은 염기를 읽은 구간은 늘지 않았습니다. 불확실한 끝을 연결 근거로 쓰기 어려워 보류했습니다.'
+    if reason.startswith('짧은 겹침에'):
+        return '짧은 연결 구간에 두 군데 길이 차이가 있고, 그 사이 또는 바깥 끝부분을 뒷받침하는 품질이 부족합니다.'
+    if reason.startswith('겹침 끝'):
+        return '겹치는 구간의 끝부분에 품질이 낮은 차이가 모여 있고, 연결되지 않은 끝도 남아 있습니다. 연결 경계가 불확실합니다.'
+    if reason.startswith('겹침 길이·일치율'):
+        return '같은 구간을 읽은 길이, 염기 일치, 품질, 두 끝의 연결 상태가 현재 예측 기준을 통과했습니다.'
+    if reason.startswith('긴 저품질 겹침의'):
+        return '긴 겹침 안에 낮은 품질이 많지만, 연결 위치와 높은 품질의 차이를 따로 확인하는 보완 기준을 통과했습니다. 실제 조립 확인이 필요합니다.'
+    if reason.startswith('연결 끝까지 정렬된') or reason.startswith('첫 Gap 앞 /'):
+        return '작은 길이 차이는 있지만 연결 끝까지 맞춰지고 주변의 품질 근거가 있어, 기존 사례에서 보완한 기준으로 생성 가능성을 인정했습니다.'
+    if reason.startswith('말단 ') and '비교에서' in reason:
+        return '끝의 아주 짧은 불확실한 부분을 제외해 비교했을 때 연결 근거가 확보되었습니다. 기존 사례에서 보완한 기준이 적용되었습니다.'
+    if row['prediction'].get('decision_rule') == 'long_low_quality':
+        return (f"같은 구간 {o['paired_bases']} bp를 비교했고, 양쪽 모두 품질이 좋으면서 같은 염기를 읽은 곳은 "
+                f"{o['q20_matches']}개입니다. 자세한 보완 기준은 기술 지표에서 볼 수 있습니다.")
+    return reason
+
+
+def plain_prediction_reasons(row):
+    return list(dict.fromkeys(plain_reason(reason, row) for reason in row['prediction']['reasons']))
+
+
+def review_export(rows, review):
+    records = summary_rows(rows)
+    for record, row in zip(records, rows):
+        record.update({'쉬운 판정 설명': ' / '.join(plain_prediction_reasons(row)),
+                       '재반응 검토': review['label'], '재반응 판정 코드': review['code'],
+                       '재반응 근거': ' / '.join(review['reasons']),
+                       '다음 확인 사항': review['next_step'], '검증 상태': review['validation'],
+                       '실제 조립 결과(사용자 입력)': ACTUAL_RESULTS[review['actual_result']],
+                       '최종 품질 통과(사용자 입력)': review['final_qc_passed'],
+                       '재반응 기준 버전': review['rule_version']})
+        for p in review['profiles']:
+            record[p['direction'] + ' 파일 SHA256'] = p['source_sha256']
+    return records
+
+
+def render_rerun_review(rows, reads):
+    st.subheader("재반응 검토")
+    st.caption("현재 서열과 Quality로 검토 방향을 제안합니다. 실제 재반응의 성공률은 아직 검증되지 않았습니다.")
+    identity = sha256(json.dumps([
+        (r.file_name, r.source_sha256 or sha256((r.sequence + str(r.qualities)).encode()))
+        for r in reads
+    ], ensure_ascii=False).encode())[:20]
+    with st.expander("실제 결과를 알고 있다면 입력해 주세요", expanded=False):
+        actual = st.selectbox("실제 조립 결과", list(ACTUAL_RESULTS),
+                              format_func=ACTUAL_RESULTS.get, key="actual_" + identity)
+        qc = False
+        if actual == 'joined':
+            qc = st.checkbox("실제 Contig가 최종 품질·필요 구간·동정 기준을 모두 통과했습니다",
+                             key="qc_" + identity)
+        st.caption("입력은 현재 파일의 검토와 다운로드에만 반영됩니다. 예측 규칙을 자동으로 학습하거나 바꾸지 않습니다.")
+        if actual == 'no_blast':
+            st.info("No blast만으로 조립 실패를 확정하지 않습니다. 실제 Contig 생성 여부를 별도로 확인해 주세요.")
+    review = recommend_rerun(reads, rows, actual, qc)
+    if review['code'] == 'no_rerun':
+        st.success(review['label'])
+    elif review['code'] in ('f_only', 'r_only', 'both', 'prediction_mismatch'):
+        st.warning(review['label'])
+    else:
+        st.info(review['label'])
+    for reason in review['reasons']:
+        st.write("• " + reason)
+    st.write("**다음 확인:** " + review['next_step'])
+    st.caption(review['validation'])
+
+    with st.expander("추천에 사용한 F/R 품질 비교", expanded=False):
+        for column, profile in zip(st.columns(2), review['profiles']):
+            with column:
+                st.write("**" + profile['direction'] + " 방향**")
+                st.caption(profile['file_name'])
+                st.write(f"원본 길이: {profile['original_bases']} bp")
+                st.write(f"원본에서 Q20 이상인 A/C/G/T: {profile['original_q20']} bp")
+                st.write(f"네 조건 중 가장 많이 남은 Q20 염기: {profile['max_retained_q20']} bp")
+                st.write(f"원본에서 Q20 이상이 끊기지 않고 이어진 최장 구간: {profile['longest_continuous_q20']} bp")
+        st.caption("Q20 염기 합계와 연속 구간 길이는 다릅니다. 이 숫자만으로 필요한 구간 전체를 읽었다고 판단하지 않습니다.")
+        if review['local_evidence']:
+            table = []
+            for item in review['local_evidence']:
+                f, r = item['directions']['F'], item['directions']['R']
+                table.append({"조건": item['condition'], "같은 구간을 비교한 길이(bp)": item['paired_bases'],
+                              "겹침의 F Q20 비중": f"{f['q20_fraction']:.0%}",
+                              "겹침의 R Q20 비중": f"{r['q20_fraction']:.0%}",
+                              "F가 저품질·R이 Q30 이상인 차이(개)": f['weak_differences'],
+                              "R이 저품질·F가 Q30 이상인 차이(개)": r['weak_differences']})
+            st.dataframe(pd.DataFrame(table), hide_index=True, use_container_width=True)
+        st.caption("‘차이’는 서로 다른 염기 또는 확정하지 못한 염기 위치입니다. Gap이 표시된 방향만으로 재반응 방향을 정하지 않습니다.")
+        st.write("현재 단측 검토 기준: 한쪽이 네 조건 모두 최소 유효 염기 수에 못 미치거나, "
+                 "겹침에서 한쪽 Q20 비중이 50% 미만·반대쪽 80% 이상이고 방향별 품질 차이가 있는 "
+                 "염기 위치가 3개 이상인 패턴이 두 조건 이상에서 확인되어야 합니다. "
+                 "양쪽의 높은 품질이 서로 충돌하거나 조건별 방향이 다르면 먼저 보류합니다.")
+        st.caption("이 수치는 초기 검토용 기준입니다. 같은 파일의 여러 조건은 독립된 검증 표본이 아니며, 재반응 전후 자료로 기준을 개선할 예정입니다.")
+    return review
+
+
+def explain_metrics(row):
+    o = row['overlap']
+    if not o:
+        return []
+    return [
+        {"살펴본 내용": "같은 구간을 읽은 길이", "이번 결과": f"{o['paired_bases']} bp",
+         "뜻": "두 방향에서 공통으로 비교할 수 있는 염기 수입니다. 빈칸은 길이에 포함하지 않습니다."},
+        {"살펴본 내용": "전체 일치율", "이번 결과": f"{o['gap_identity']:.1f}%",
+         "뜻": "두 서열을 나란히 놓았을 때 같은 염기의 비율입니다. 빈칸도 차이로 계산합니다."},
+        {"살펴본 내용": "품질이 좋은 공통 염기", "이번 결과": f"{o['q20_matches']}개",
+         "뜻": "F와 R이 같은 염기를 읽었고, 두 방향 모두 Q20 이상인 위치입니다."},
+        {"살펴본 내용": "품질이 좋은데 서로 다른 결과", "이번 결과": f"{o['q20_conflicts']}개",
+         "뜻": "높은 품질이 차이를 뒷받침하는 위치입니다. 어느 방향이 틀렸다는 뜻은 아닙니다."},
+        {"살펴본 내용": "길이를 맞추려고 넣은 빈칸(Gap)", "이번 결과": f"{o['gaps']}개",
+         "뜻": "한쪽에 대응되는 염기가 없어 빈칸을 넣었습니다. 실제 삽입·결실로 확정한 것은 아닙니다."},
+        {"살펴본 내용": "연결 끝에서 대응하지 않는 염기", "이번 결과": f"{o['junction_unaligned']} bp · 이 중 Q20 이상 {o['junction_q20']} bp",
+         "뜻": "서로 이어져야 할 끝부분에 남은 염기입니다. 최종 Contig에서 제거할 길이라는 뜻은 아닙니다."},
+    ]
+
+
+def original_event_positions(row):
+    o = row['overlap']
+    names = {'F Gap': 'F 쪽 빈칸(길이 차이)', 'R Gap': 'R 쪽 빈칸(길이 차이)',
+             '모호한 염기': 'A/C/G/T로 확정하지 못한 염기', '염기 불일치': '서로 다른 염기'}
+    records = []
+    for e in o['events']:
+        f, r = e['f_position'], e['r_position']
+        f_original = row['trim_metadata'][0]['start_1based'] + f - 1 if f is not None else None
+        if r is not None:
+            offset = row['lengths'][1] - r if o['reverse_orientation'] == 'Reverse complement' else r - 1
+            r_original = row['trim_metadata'][1]['start_1based'] + offset
+        else:
+            r_original = None
+        records.append({'정렬에서의 위치': e['column'], '관찰한 차이': names.get(e['kind'], e['kind']),
+                        '원본 F 위치': str(f_original) if f_original is not None else '빈칸',
+                        '원본 R 위치': str(r_original) if r_original is not None else '빈칸',
+                        '차이를 뒷받침하는 Q': e['support_q']})
+    return records
+
+
 def render_result(rows, reads):
     st.subheader("Contig 생성 예측")
     st.caption("F/R 조립 가능성에 대한 예측입니다. BLAST 동정 결과는 별도로 확인해 주세요.")
@@ -878,138 +1244,121 @@ def render_result(rows, reads):
                 st.markdown(f"### {row['condition']['label']}")
                 st.metric("예측 결과", prediction["label"])
                 if prediction["state"] == "joined":
-                    st.success("생성 예상")
+                    st.success("두 방향을 하나로 연결할 수 있을 것으로 예상")
                 elif prediction["state"] == "separate":
-                    st.warning("생성 안 됨 · F/R 분리 예상")
+                    st.warning("Contig2 · 두 방향이 하나로 연결되지 않을 것으로 예상")
                 else:
-                    st.warning("생성 안 됨 · 유효 서열 부족")
-                st.write(f"F **{row['lengths'][0]} bp** · R **{row['lengths'][1]} bp**")
+                    st.warning("No contig · 연결에 쓸 서열이나 품질이 부족")
+                st.write(f"품질 정리 후 길이: F **{row['lengths'][0]} bp** · R **{row['lengths'][1]} bp**")
                 overlap = row["overlap"]
                 if overlap:
                     st.write(f"모델 겹침 **{overlap['paired_bases']} bp** · 일치율 **{overlap['gap_identity']:.1f}%**")
                 else:
-                    st.write("겹침 없음")
+                    st.write("비교할 겹침을 찾지 못했습니다.")
 
-    with st.expander("판정 근거·정렬 상세", expanded=False):
-        st.caption("겹침·일치율은 모델 정렬에서 계산한 값이며 실제 조립 출력의 사용 구간과 다를 수 있습니다.")
-        selected = st.selectbox("상세 조건", [c.label for c in CONDITIONS], key="details_condition")
+    review = render_rerun_review(rows, reads)
+    with st.expander("판정 근거 · 쉽게 보기", expanded=False):
+        selected = st.selectbox("설명할 조건", [c.label for c in CONDITIONS], key="details_condition")
         row = next(row for row in rows if row["condition"]["label"] == selected)
-        st.write("**" + row["prediction"]["label"] + " 예측 근거**")
-        for reason in row["prediction"]["reasons"]:
+        st.write("**이 조건을 이렇게 예상한 이유**")
+        for reason in plain_prediction_reasons(row):
             st.write("• " + reason)
-        if row["prediction"].get("standard_reasons"):
-            st.write("기본 기준에서 검토가 필요했던 항목:")
-            for reason in row["prediction"]["standard_reasons"]:
-                st.write("• " + reason)
-        st.dataframe(pd.DataFrame(row["trim_metadata"]).rename(columns={
-            "read": "Read", "start_1based": "시작 위치", "end_1based": "끝 위치",
-            "original_bases": "원본 길이", "retained_bases": "남은 길이",
-        }), hide_index=True, use_container_width=True)
-        st.write(f"Q20 이상 유효 염기: F {row['quality_bases'][0]} bp · "
-                 f"R {row['quality_bases'][1]} bp")
-        overlap = row["overlap"]
-        if overlap:
-            st.write(f"R 처리: {overlap['reverse_orientation']} · 배치: {overlap['connection']}")
-            st.write(f"Gap {overlap['gaps']} bp · 최장 Gap {overlap['longest_gap']} bp · "
-                     f"Q20 일치 {overlap['q20_matches']} bp · "
-                     f"Q20 염기 충돌 {overlap['q20_base_conflicts']}개 / Gap 충돌 {overlap['q20_gap_conflicts']}개")
-            st.write(f"연결 경계의 정렬 밖 염기 {overlap['junction_unaligned']} bp "
-                     f"(Q20 이상 {overlap['junction_q20']} bp)")
-            st.write(f"Q20 지지 Gap 구간: F 정렬 {overlap['q20_gap_regions']['F']}개 · "
-                     f"R 정렬 {overlap['q20_gap_regions']['R']}개")
-            if overlap["gaps"]:
-                anchors = overlap["gap_outer_q20_anchors"]
-                st.write(f"Gap 바깥쪽 연속 Q20 일치: 첫 Gap 앞 {anchors['left']} bp · "
-                         f"마지막 Gap 뒤 {anchors['right']} bp")
-            pair = overlap.get("opposing_gap_pair")
-            if pair:
-                st.write(f"반대 방향 Gap 두 개 중 Q20 이상 {pair['q20_gap_count']}개 · "
-                         f"두 Gap 사이 최장 연속 Q20 일치 {pair['between_q20_run']} bp")
-            cluster = overlap["conflict_cluster"]
-            if cluster["count"]:
-                st.write(f"국소 Q20 충돌 최대 {cluster['count']}개 · "
-                         f"정렬 위치 {cluster['start_column']}–{cluster['end_column']} "
-                         f"({cluster['window_columns']}개 정렬 열)")
-            evidence = long_overlap_evidence(overlap)
-            st.write(f"양쪽 Q30 충돌 {evidence['q30_conflicts']}개 · "
-                     f"양쪽 Q20 지지 비중 {evidence['q20_supported_fraction']:.1%}")
-            if overlap["paired_bases"] > MAX_SHORT_GAP_PAIR_BASES:
-                st.dataframe(pd.DataFrame([
-                    {"긴 저품질 겹침 보정 항목": name, "충족": passed}
-                    for name, passed in evidence["checks"].items()
-                ]), hide_index=True, use_container_width=True)
-            st.code(alignment_preview(overlap), language=None)
-            core = overlap.get("core_alignment")
-            if core:
-                st.write(f"말단 확장을 보수적으로 평가한 비교: 겹침 {core['paired_bases']} bp · "
-                         f"Gap {core['gaps']} bp · 연결 경계 잔여 {core['junction_unaligned']} bp")
-                st.code(alignment_preview(core), language=None)
-            if overlap["events"]:
-                st.dataframe(pd.DataFrame(overlap["events"]).rename(columns={
-                    "column": "정렬 위치", "kind": "차이 유형", "f_position": "F 위치",
-                    "r_position": "정렬 방향 R 위치", "support_q": "충돌 지지 Q",
-                }), hide_index=True, use_container_width=True)
-        st.caption(
-            f"공통 예측 기준: F/R 각각 {MIN_READ_BASES} bp 이상, 겹침 {MIN_OVERLAP_BASES} bp 이상, "
-            f"Gap 포함 일치율 {MIN_GAP_IDENTITY:g}% 이상, 양쪽 Q20 일치 {MIN_Q20_MATCHES} bp 이상, "
-            f"Q20 충돌 {MAX_Q20_CONFLICT_RATE:.0%} 이하, 연결 경계 Q20 잔여 {MAX_Q20_JUNCTION} bp 이하, "
-            f"최장 Gap {MAX_GAP_RUN} bp 이하. Q20 염기 불일치 없이 단염기 Gap 하나만 "
-            "Q20으로 뒷받침되는 경우는 충돌 비율만으로 기각하지 않습니다. "
-            f"겹침 내 {CONFLICT_CLUSTER_COLUMNS}개 정렬 열 안에 Q20 충돌 "
-            f"{MIN_CLUSTER_Q20_CONFLICTS}개 이상이 집중되면 통과시키지 않습니다. "
-            f"검증용 보정: 한쪽의 Q20 이상 A/C/G/T가 {MIN_Q20_READ_BASES} bp 미만이면 "
-            f"No contig, 양쪽 정렬에 Q20 지지 Gap이 각각 {MIN_BIDIRECTIONAL_GAP_REGIONS}구간 "
-            "이상이면 Contig2로 예측합니다. "
-            "연결되는 두 끝까지 정렬되고, 차이가 양쪽의 Q20 단염기 Gap 한 개씩뿐이면 "
-            f"첫 Gap 앞 또는 마지막 Gap 뒤에 연속 Q20 일치가 {MIN_GAP_PAIR_OUTER_Q20} bp "
-            "이상 있는 경우에만 충돌 비율 예외를 적용합니다. 나머지 기준도 검사합니다. "
-            f"{MAX_SHORT_GAP_PAIR_BASES} bp 이하의 연결 겹침에서 반대 방향 단염기 Gap "
-            "두 개가 모두 저품질이면 미정렬 연결 끝이 남는 경우 Contig2로 예측합니다. "
-            f"한 Gap만 Q20 이상이면 두 Gap 사이에 연속 Q20 일치가 {MIN_MIXED_GAP_Q20_RUN} bp "
-            "이상 있어야 합니다. 전체 Q20 일치 합계와 별도로 검사합니다. "
-            f"같은 방향의 단염기 Gap 두 개는 한 개가 정렬 끝 {TERMINAL_GAP_COLUMNS}개 열 안에 "
-            "있는 경우에만 해당 예외를 적용합니다. "
-            f"짧은 말단 제외({MAX_CORE_TRIM_COLUMNS}개 열 이내)의 대체 정렬은 Q30 이상 충돌을 "
-            "숨기지 않는 경우에 한해 평가합니다. "
-            f"말단 {LOW_QUALITY_END_COLUMNS}개 열에 저품질 Gap·염기 불일치가 함께 있거나 "
-            "서로 떨어진 저품질 Gap이 두 구간 이상 있고, 미정렬 연결 경계도 남으면 "
-            "Contig2로 예측합니다. 연속 Gap은 한 구간으로 셉니다. "
-            f"긴 저품질 겹침 보정: 겹침 {MAX_SHORT_GAP_PAIR_BASES} bp 초과이고 양쪽 Q20 "
-            f"지지 비중이 {LONG_OVERLAP_MAX_Q20_FRACTION:.0%} 미만이면 별도 기준을 검사합니다. "
-            f"일치율 {LONG_OVERLAP_MIN_IDENTITY:g}% 이상, 정렬 점수 {LONG_OVERLAP_MIN_SCORE:g} 이상, "
-            f"양쪽 Q20 일치 {LONG_OVERLAP_MIN_Q20_MATCHES} bp 이상, 양쪽 Q30 충돌 "
-            f"{LONG_OVERLAP_MAX_Q30_CONFLICTS}개 이하, F→R 또는 R→F 연결 배치, "
-            f"연결 끝 미정렬 {LONG_OVERLAP_MAX_JUNCTION} bp 이하 "
-            f"(Q20 이상 {LONG_OVERLAP_MAX_Q20_JUNCTION} bp 이하), 최장 Gap {MAX_GAP_RUN} bp 이하를 "
-            "모두 충족할 때만 생성으로 보정합니다. 유효 서열 부족에는 적용하지 않습니다. "
-            "제공된 사례로 보정한 예측 기준이며 새 샘플의 정확도는 별도 검증이 필요합니다."
-        )
+        if row['prediction'].get('standard_reasons'):
+            st.info("일반 기준에서 부족한 항목이 있지만, 기존 사례에 근거한 보완 기준을 통과한 예측입니다. 실제 조립 확인이 필요합니다.")
+        st.write("**숫자를 읽는 방법**")
+        st.write("bp는 서열 길이를 세는 단위이고, Q는 염기를 얼마나 확실하게 읽었는지를 나타내는 품질 값입니다. "
+                 "여기서는 Q20 이상을 품질 비교 기준으로 사용합니다. Q20 염기 비중은 재반응 성공 확률이 아닙니다.")
+        metrics = explain_metrics(row)
+        if metrics:
+            st.dataframe(pd.DataFrame(metrics), hide_index=True, use_container_width=True)
+        st.write("**품질이 낮은 부분을 제외한 결과**")
+        for role, meta, count in zip(('F', 'R'), row['trim_metadata'], row['quality_bases']):
+            if meta['retained_bases']:
+                st.write(f"{role}: 원본 {meta['original_bases']} bp 중 {meta['start_1based']}–{meta['end_1based']}번을 사용했습니다. "
+                         f"남은 {meta['retained_bases']} bp 중 Q20 이상 A/C/G/T는 {count} bp입니다.")
+            else:
+                st.write(f"{role}: 이 조건에서는 품질 정리 후 사용할 서열이 남지 않았습니다.")
+        st.caption("조건 16과 10은 QT만 사용합니다. 20/10과 30/20의 앞 숫자는 QT, 뒤 숫자는 New QT의 검사 창 크기입니다. 두 번째 품질 기준값이 아닙니다.")
 
-    with st.expander("AB1 원본 Quality", expanded=False):
-        st.dataframe(quality_summary(reads), hide_index=True, use_container_width=True)
+    with st.expander("정렬 상세 · 읽는 법과 기술 지표", expanded=False):
+        st.write(f"**현재 보는 조건: {selected}** · 조건은 ‘판정 근거 · 쉽게 보기’에서 바꿀 수 있습니다.")
+        st.caption("아래는 프로그램이 비교한 정렬입니다. 실제 조립 출력에서 사용하는 위치와 다를 수 있습니다.")
+        o = row['overlap']
+        if not o:
+            st.write("표시할 정렬이 없습니다. 남은 서열의 길이와 품질을 먼저 확인해 주세요.")
+        else:
+            if o['reverse_orientation'] == 'Reverse complement':
+                st.write("R은 F와 같은 방향에서 비교할 수 있도록 순서를 뒤집고 상보 염기로 바꿨습니다. 원본 파일은 바꾸지 않습니다.")
+            else:
+                st.write("R을 원본 방향으로 놓았을 때 더 잘 맞아 그 비교를 표시합니다.")
+            if o['connection'] in ('F → R', 'R → F'):
+                st.write("연결 배치: **" + o['connection'] + "**. 화살표 순서로 두 읽기 구간이 이어지는 배치입니다.")
+            else:
+                st.write("연결 배치: **" + o['connection'] + "**. 한 읽기 구간이 다른 구간 안에 들어가는 배치입니다.")
+            st.write("**정렬 읽는 법:** 위 줄은 F, 아래 줄은 방향을 맞춘 R입니다. "
+                     "가운데 `|`는 같은 염기, `.`은 다른 염기, `?`는 확정하기 어려운 염기입니다. "
+                     "서열 안의 `-`는 길이를 맞추기 위해 넣은 빈칸(Gap)입니다.")
+            st.caption("빈칸이 생긴 방향이 재반응해야 할 방향이라는 뜻은 아닙니다. 이 정렬만으로 Mix·InDel을 확정할 수 없습니다.")
+            st.code(alignment_preview(o, width=70), language=None)
+            core = o.get('core_alignment')
+            if core:
+                st.write("**끝부분을 더 엄격하게 비교한 정렬**")
+                st.write("같은 입력을 다른 정렬 점수로 다시 비교했습니다. 어느 한쪽을 고쳐서 만든 결과가 아니며, "
+                         "끝을 조금 다르게 잡아도 연결 근거가 유지되는지 보는 참고 자료입니다.")
+                st.write(f"겹침 {core['paired_bases']} bp · 빈칸 {core['gaps']}개 · 연결 끝에서 대응하지 않는 염기 {core['junction_unaligned']} bp")
+                st.code(alignment_preview(core, width=70), language=None)
+            if o['events']:
+                st.write("**원본 파형에서 확인할 위치**")
+                st.caption("위치는 업로드한 AB1의 원본 염기 순서로, 1부터 셉니다. R의 방향 변환과 품질 절단을 되돌려 표시했습니다. 빈칸에는 대응 염기 위치가 없습니다.")
+                st.dataframe(pd.DataFrame(original_event_positions(row)), hide_index=True, use_container_width=True)
+                st.caption("‘차이를 뒷받침하는 Q’는 양쪽 품질 중 보수적인 값을 사용합니다. 빈칸은 반대편 인접 염기의 품질도 함께 봅니다.")
+            anchors, pair = o['gap_outer_q20_anchors'], o.get('opposing_gap_pair')
+            st.write(f"빈칸 바깥에서 두 방향 모두 Q20 이상으로 연속 일치한 길이: 앞 {anchors['left']} bp · 뒤 {anchors['right']} bp")
+            if pair:
+                st.write(f"서로 반대 방향의 빈칸 두 개 사이에서 두 방향 모두 Q20 이상으로 연속 일치한 최장 길이: {pair['between_q20_run']} bp")
+            evidence = long_overlap_evidence(o)
+            st.write(f"양쪽 Q30 이상이 뒷받침하는 차이: {evidence['q30_conflicts']}개")
+            if o['paired_bases'] > MAX_SHORT_GAP_PAIR_BASES:
+                st.write("긴 저품질 겹침에 적용하는 보완 기준:")
+                st.dataframe(pd.DataFrame([
+                    {'기술 항목': name, '현재 기준 충족': '예' if passed else '아니요'}
+                    for name, passed in evidence['checks'].items()
+                ]), hide_index=True, use_container_width=True)
+        st.write("**기존 판정 기준의 상세 기록**")
+        for reason in row['prediction']['reasons']:
+            st.write("• " + reason)
+        if row['prediction'].get('standard_reasons'):
+            st.write("보완 기준 적용 전에 부족했던 항목:")
+            for reason in row['prediction']['standard_reasons']:
+                st.write("• " + reason)
+        st.caption("예측 기준은 제공된 실제 사례로 보완한 규칙입니다. 사내 조립기의 내부 규칙과 완전히 같거나 새 샘플에서 검증된 정확도라는 뜻은 아닙니다.")
+
+    with st.expander("AB1 원본 품질 · 위치별 그래프", expanded=False):
+        st.write("가로축은 원본 염기 위치, 세로축은 Quality입니다. 값이 낮아지는 위치를 살펴보세요. 이 그래프는 형광 피크 파형 자체가 아닙니다.")
+        st.dataframe(quality_summary(reads).rename(columns={"Read": "방향", "길이": "원본 길이(bp)"}),
+                     hide_index=True, use_container_width=True)
         for column, read in zip(st.columns(2), reads):
             with column:
                 st.caption(read.file_name)
-                frame = pd.DataFrame({"염기 위치": range(1, len(read.qualities) + 1), "Quality": read.qualities})
-                st.line_chart(frame.set_index("염기 위치"))
+                frame = pd.DataFrame({"원본 염기 위치": range(1, len(read.qualities) + 1), "Quality": read.qualities})
+                st.line_chart(frame.set_index("원본 염기 위치"))
 
-    with st.expander("재반응 검토", expanded=False):
-        if joined:
-            st.write("생성 예상 조건의 겹침 구간과 원본 파형을 확인해 주세요.")
-        else:
-            st.write("각 조건에서 남은 F/R 길이와 겹침 구간을 먼저 확인해 주세요. "
-                     "유효 서열 부족은 해당 방향의 Quality, 충돌이 많은 경우는 양쪽 파형을 함께 검토합니다.")
-        st.caption("정렬의 Gap이나 불일치만으로 혼합 또는 InDel을 확정할 수는 없습니다.")
-
-    st.download_button("분석 결과 다운로드 (CSV)",
-        pd.DataFrame(summary_rows(rows)).to_csv(index=False).encode("utf-8-sig"),
-        file_name="contig_prediction.csv", mime="text/csv", key="result_download")
+    st.download_button("분석·재반응 검토 결과 다운로드 (CSV)",
+                       pd.DataFrame(review_export(rows, review)).to_csv(index=False).encode("utf-8-sig"),
+                       file_name="contig_prediction.csv", mime="text/csv", key="result_download")
+    snapshot = {'schema_version': 1, 'app_version': APP_VERSION,
+                'recommendation': review, 'conditions': rows,
+                'note': '실제 결과와 QC는 사용자 입력입니다. 재반응 효과를 검증한 기록이 아닙니다.'}
+    st.download_button("후속 비교용 분석 기록 다운로드 (JSON)",
+                       json.dumps(snapshot, ensure_ascii=False, indent=2).encode('utf-8'),
+                       file_name="contig_review_record.json", mime="application/json", key="review_download")
+    st.caption("재반응 전 AB1, 재반응 후 AB1, 실제 조립 결과와 이 기록을 함께 남기면 이후 판정 근거를 비교하기 좋습니다.")
 
 
 def main():
     st.set_page_config(page_title="Contig Simulator", page_icon="🧬", layout="wide")
     st.title("🧬 Contig Simulator")
-    st.write("F/R AB1 파일을 업로드하면 네 조건의 Contig 생성 여부를 예측합니다.")
+    st.write("F/R AB1 파일을 업로드하면 네 조건의 Contig 생성 여부와 재반응 검토 방향을 확인할 수 있습니다.")
     st.caption(f"{APP_VERSION} · 검증용 예측이며 실제 조립 결과와 다를 수 있습니다.")
     left, right = st.columns(2)
     with left:
