@@ -22,7 +22,7 @@ from Bio import SeqIO
 from Bio.Align import PairwiseAligner
 from Bio.Seq import Seq
 
-APP_VERSION = "2026.10.19-ab1-v14"
+APP_VERSION = "2026.10.20-ab1-v15"
 RERUN_RULE_VERSION = "quality-review-v1"
 # 재반응 전후 검증 전의 보수적 검토 기준. 성공 확률이나 사내 SOP가 아니다.
 RERUN_REFERENCE_FRACTION = 0.80
@@ -50,6 +50,11 @@ TERMINAL_GAP_COLUMNS = 10
 LOW_QUALITY_END_COLUMNS = 12
 MAX_CORE_TRIM_COLUMNS = 5
 CORE_CONFLICT_QUALITY_LIMIT = 30
+# 2026-10-20 실제 ACE 대조에서 확인한 짧은 겹침의 제한적 허용 범위.
+# Gap 지지 Q<10인 불안정한 말단 및 Q30 이상 충돌은 이 보정에서 제외한다.
+SHORT_GAP_MIN_SUPPORT_Q = 10
+SHORT_GAP_MAX_SUPPORT_Q = 30  # exclusive
+MAX_SHORT_LOW_Q_JUNCTION = 5
 # 긴 겹침의 다수가 Q20 미만일 때만 사용하는 경험적 보정.
 # 전체 판정 기준을 낮추지 않고, 강한 품질 충돌과 연결 위치를 별도로 검사한다.
 LONG_OVERLAP_MIN_IDENTITY = 70.0
@@ -664,6 +669,79 @@ def long_overlap_evidence(overlap):
             "q30_conflicts": int(q30_conflicts), "checks": checks}
 
 
+def supported_short_gap_pair(overlap):
+    """중간의 연속 품질 지지가 있는 중간 품질 단염기 Gap 쌍의 제한적 허용.
+
+    두 정렬에서 같은 read 좌표의 반대 방향 Gap 두 개가 유지되고, 그 사이
+    양쪽 Q20 연속 일치가 30 bp 이상일 때만 인정한다. Q10 미만의 불안정한
+    Gap, Q30 이상 충돌, 염기 불일치, 고품질 미정렬 끝은 허용하지 않는다.
+    실제 ACE 6개로 보정한 경험적 범위이며 독립 검증된 조립 규칙이 아니다.
+    샘플명·프라이머·조건·정답 파일은 판정에 사용하지 않는다.
+    """
+    if not overlap:
+        return None
+    core = overlap.get("core_alignment")
+    if (not core or core.get("connection") != overlap.get("connection")
+            or core.get("reverse_orientation") != overlap.get("reverse_orientation")):
+        return None
+    gaps_by_alignment = []
+    for item in (overlap, core):
+        pair = item.get("opposing_gap_pair")
+        if (not pair or item.get("connection") not in ("F → R", "R → F")
+                or not MIN_OVERLAP_BASES <= item.get("paired_bases", 0) <= MAX_SHORT_GAP_PAIR_BASES
+                or item.get("gap_identity", 0) < MIN_GAP_IDENTITY
+                or item.get("q20_matches", 0) < MIN_Q20_MATCHES
+                or item.get("gaps") != 2 or item.get("longest_gap") != 1
+                or item.get("mismatches") != 0 or item.get("ambiguous") != 0
+                or item.get("q20_base_conflicts") != 0
+                or item.get("junction_q20") != 0
+                or item.get("junction_unaligned", MAX_SHORT_LOW_Q_JUNCTION + 1) > MAX_SHORT_LOW_Q_JUNCTION
+                or pair.get("between_q20_run", 0) < MIN_MIXED_GAP_Q20_RUN):
+            return None
+        gaps = item.get("events", [])
+        if (len(gaps) != 2 or {e["kind"] for e in gaps} != {"F Gap", "R Gap"}
+                or not all(SHORT_GAP_MIN_SUPPORT_Q <= e["support_q"] < SHORT_GAP_MAX_SUPPORT_Q
+                           for e in gaps)):
+            return None
+        gaps_by_alignment.append(gaps)
+    def signatures(events):
+        return sorted(tuple(e[key] for key in ("kind", "f_position", "r_position", "support_q"))
+                      for e in events)
+    if signatures(gaps_by_alignment[0]) != signatures(gaps_by_alignment[1]):
+        return None
+    values = [e["support_q"] for e in gaps_by_alignment[0]]
+    return {"between_q20_run": overlap["opposing_gap_pair"]["between_q20_run"],
+            "core_between_q20_run": core["opposing_gap_pair"]["between_q20_run"],
+            "min_gap_support_q": min(values), "max_gap_support_q": max(values),
+            "junction_unaligned": overlap["junction_unaligned"],
+            "core_junction_unaligned": core["junction_unaligned"]}
+
+
+def supported_terminal_core(overlap):
+    """말단 확장만 불안정하고 중심 정렬은 단순·고품질인 경우의 제한적 허용.
+
+    기존 말단 확장 검사가 확인한 동일 좌표 중심부만 사용한다. 중심에
+    Q20 충돌이나 복수 Gap, 염기 불일치가 있으면 허용하지 않는다.
+    실제 성공 ACE 2개로 보정했으며 입력 서열이나 정렬을 고쳐 쓰지 않는다.
+    """
+    extension = unsupported_terminal_extension(overlap)
+    if not extension:
+        return None
+    core = overlap["core_alignment"]
+    for item in (overlap, core):
+        if (item["gap_identity"] < MIN_GAP_IDENTITY
+                or item["mismatches"] or item["ambiguous"] or item["q20_conflicts"]
+                or item["junction_q20"] or item["junction_unaligned"] > MAX_SHORT_LOW_Q_JUNCTION
+                or item["longest_gap"] > 1):
+            return None
+    if core["gaps"] > 1 or overlap["gaps"] > 2:
+        return None
+    return {"extension_columns": extension["extension_columns"],
+            "core_paired_bases": core["paired_bases"], "core_q20_matches": core["q20_matches"],
+            "core_gaps": core["gaps"], "core_q20_conflicts": core["q20_conflicts"],
+            "core_junction_unaligned": core["junction_unaligned"]}
+
+
 def predict_contig(lengths, overlap, quality_bases=None):
     """품질이 뒷받침하는 충돌과 낮은 품질의 차이를 분리해 평가한다.
 
@@ -690,6 +768,8 @@ def predict_contig(lengths, overlap, quality_bases=None):
     reasons = []
     terminal_gap_exception_applied = False
     terminal_realign_applied = False
+    supported_pair = supported_short_gap_pair(overlap)
+    supported_core = supported_terminal_core(overlap)
     if overlap is None or overlap["paired_bases"] < MIN_OVERLAP_BASES:
         reasons.append(f"연결에 필요한 겹침이 {MIN_OVERLAP_BASES} bp 미만입니다.")
     if overlap is not None:
@@ -707,7 +787,7 @@ def predict_contig(lengths, overlap, quality_bases=None):
                                     and terminal_realign_supported(overlap))
         if (overlap["q20_conflict_rate"] > MAX_Q20_CONFLICT_RATE
                 and not single_indel and not terminal_gap_exception_applied
-                and not terminal_realign_applied):
+                and not terminal_realign_applied and not supported_pair):
             reasons.append(f"복수 Gap 또는 염기 불일치의 Q20 충돌 비율이 {MAX_Q20_CONFLICT_RATE:.0%}를 초과합니다.")
         cluster = overlap["conflict_cluster"]
         if cluster["count"] >= MIN_CLUSTER_Q20_CONFLICTS:
@@ -728,9 +808,10 @@ def predict_contig(lengths, overlap, quality_bases=None):
             reasons.append(f"연결 경계에 정렬되지 않은 Q20 이상 염기가 {MAX_Q20_JUNCTION} bp를 초과합니다.")
         if overlap["longest_gap"] > MAX_GAP_RUN:
             reasons.append(f"연속 Gap이 {MAX_GAP_RUN} bp를 초과합니다.")
-        reasons.extend(short_gap_pair_reasons(overlap))
+        if not supported_pair:
+            reasons.extend(short_gap_pair_reasons(overlap))
         extension = unsupported_terminal_extension(overlap)
-        if extension:
+        if extension and not supported_core:
             reasons.append(
                 f"보수적 비교보다 말단 {extension['extension_columns']}개 정렬 열을 확장했지만 "
                 "양쪽 Q20 이상 일치는 늘지 않았습니다. "
@@ -780,8 +861,25 @@ def predict_contig(lengths, overlap, quality_bases=None):
         passed.append(f"말단 {MAX_CORE_TRIM_COLUMNS}개 정렬 열 이내를 제외한 비교에서 "
                       f"염기 불일치가 해소되고 남은 Gap의 지지 Q가 {CORE_CONFLICT_QUALITY_LIMIT} 미만입니다 "
                       "(충돌 비율 예외: 검증용 보정).")
-    return {"label": "Contig 생성", "state": "joined", "generated": True,
-            "reasons": passed}
+    result = {"label": "Contig 생성", "state": "joined", "generated": True, "reasons": passed}
+    corrections = {}
+    if supported_pair:
+        corrections["supported_short_gap_pair"] = supported_pair
+        passed.append(f"반대 방향 단염기 Gap 두 개의 지지 Q가 {supported_pair['min_gap_support_q']}–"
+                      f"{supported_pair['max_gap_support_q']}이고, 그 사이 양쪽 Q20 연속 일치가 "
+                      f"{supported_pair['between_q20_run']} bp입니다. 보수적 정렬에서도 같은 Gap과 "
+                      "연속 일치가 유지되어 연결을 허용했습니다 (검증용 보정).")
+    if supported_core:
+        corrections["supported_terminal_core"] = supported_core
+        passed.append(f"불안정한 말단 {supported_core['extension_columns']}개 정렬 열을 제외한 중심은 "
+                      f"겹침 {supported_core['core_paired_bases']} bp, 양쪽 Q20 일치 "
+                      f"{supported_core['core_q20_matches']} bp, Q20 충돌 0개, "
+                      f"저품질 Gap {supported_core['core_gaps']}개로 연결 근거가 유지됩니다 "
+                      "(검증용 보정).")
+    if corrections:
+        passed[0] = "겹침·품질·연결 경계를 확인하고, 중심 일치 근거에 따른 제한적 보완 기준을 통과했습니다."
+        result["applied_corrections"] = corrections
+    return result
 
 
 def analyze_reads(reads):
@@ -825,6 +923,8 @@ def summary_rows(rows):
             "양쪽 Q20 지지 비중 (%)": (round(100 * evidence["q20_supported_fraction"], 2)
                                     if evidence["q20_supported_fraction"] is not None else None),
             "긴 저품질 겹침 보정 적용": prediction.get("decision_rule") == "long_low_quality",
+            "중심 Q20 지지 Gap 쌍 보정 적용": "supported_short_gap_pair" in prediction.get("applied_corrections", {}),
+            "단순 중심 정렬 말단 보정 적용": "supported_terminal_core" in prediction.get("applied_corrections", {}),
             "F Q20 Gap 구간": overlap.get("q20_gap_regions", {}).get("F", 0),
             "R Q20 Gap 구간": overlap.get("q20_gap_regions", {}).get("R", 0),
             "첫 Gap 앞 연속 Q20 일치 (bp)": overlap.get("gap_outer_q20_anchors", {}).get("left", 0),
@@ -1047,6 +1147,15 @@ def plain_reason(reason, row):
         return '품질이 낮은 부분을 제외한 뒤 남은 서열이 너무 짧아 연결을 평가하기 어렵습니다. ' + reason
     if 'Q20 이상 유효 염기가' in reason:
         return reason.replace('Q20 이상 유효 염기', '품질 기준(Q20)을 넘는 A/C/G/T 염기')
+    if reason.startswith('반대 방향 단염기 Gap 두 개의'):
+        e = row['prediction']['applied_corrections']['supported_short_gap_pair']
+        return (f"작은 길이 차이 두 곳 사이에서 양쪽이 품질 좋게 연속 일치한 구간이 {e['between_q20_run']} bp입니다. "
+                "다른 정렬 방식에서도 이 근거가 유지되고 강한 품질 충돌이 없어, 보완 기준으로 연결을 허용했습니다.")
+    if reason.startswith('불안정한 말단 '):
+        e = row['prediction']['applied_corrections']['supported_terminal_core']
+        return (f"불확실한 끝부분을 제외해도 중심 {e['core_paired_bases']} bp가 겹치고, "
+                f"양쪽 모두 품질 좋은 일치가 {e['core_q20_matches']}개 남습니다. "
+                "중심에 품질 좋은 충돌이 없고 길이 차이도 적어, 보완 기준으로 연결을 허용했습니다.")
     if reason.startswith('연결에 필요한 겹침'):
         return f"F와 R이 같은 구간을 읽은 부분이 {o.get('paired_bases', 0)} bp로 짧습니다. 현재 기준은 {MIN_OVERLAP_BASES} bp 이상입니다."
     if reason.startswith('Gap 포함 일치율'):
@@ -1314,6 +1423,8 @@ def render_result(rows, reads):
             st.write("• " + reason)
         if row['prediction'].get('standard_reasons'):
             st.info("일반 기준에서 부족한 항목이 있지만, 기존 사례에 근거한 보완 기준을 통과한 예측입니다. 실제 조립 확인이 필요합니다.")
+        elif row['prediction'].get('applied_corrections'):
+            st.info("실제 Contig 정렬 사례를 반영한 제한적 보완 기준을 적용했습니다. 실제 조립 결과로 확인해 주세요.")
         st.write("**숫자를 읽는 방법**")
         st.write("bp는 서열 길이를 세는 단위이고, Q는 염기를 얼마나 확실하게 읽었는지를 나타내는 품질 값입니다. "
                  "여기서는 Q20 이상을 품질 비교 기준으로 사용합니다. Q20 염기 비중은 재반응 성공 확률이 아닙니다.")
