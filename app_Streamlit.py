@@ -22,7 +22,7 @@ from Bio import SeqIO
 from Bio.Align import PairwiseAligner
 from Bio.Seq import Seq
 
-APP_VERSION = "2026.10.20-ab1-v15"
+APP_VERSION = "2026.10.20-ab1-v16"
 RERUN_RULE_VERSION = "quality-review-v1"
 # 재반응 전후 검증 전의 보수적 검토 기준. 성공 확률이나 사내 SOP가 아니다.
 RERUN_REFERENCE_FRACTION = 0.80
@@ -55,6 +55,10 @@ CORE_CONFLICT_QUALITY_LIMIT = 30
 SHORT_GAP_MIN_SUPPORT_Q = 10
 SHORT_GAP_MAX_SUPPORT_Q = 30  # exclusive
 MAX_SHORT_LOW_Q_JUNCTION = 5
+# 같은 염기 반복 안의 동점 Gap 배치와 짧은 말단 제외를 함께 확인한다.
+MIN_CLIPPED_CORE_Q20_MATCHES = 30
+INTERNAL_REVIEW_MIN_JUNCTION_Q20 = 100
+INTERNAL_REVIEW_MAX_Q20_FRACTION = 0.20
 # 긴 겹침의 다수가 Q20 미만일 때만 사용하는 경험적 보정.
 # 전체 판정 기준을 낮추지 않고, 강한 품질 충돌과 연결 위치를 별도로 검사한다.
 LONG_OVERLAP_MIN_IDENTITY = 70.0
@@ -335,6 +339,44 @@ def conflict_cluster(events, alignment_columns):
             "end_column": best_start + width - 1 if best_start is not None else None}
 
 
+def equivalent_single_gap_support(alignment, fseq, rseq, fq, rq):
+    """일치하는 동일 염기 안에서 한 칸 Gap을 옮긴 동점 배치의 Q 범위.
+
+    원래 정렬·서열·Q는 유지한다. 맞는 염기와 단염기 Gap의 위치만 교환하며,
+    불일치·다른 염기·다른 Gap을 넘어 이동하지 않는다. 가능한 위치가 여럿인
+    경우 처음 반환된 정렬의 높은 Q만으로 강한 충돌을 확정하지 않기 위한 근거다.
+    """
+    a,b = str(alignment[0]),str(alignment[1])
+    fc,rc = map(int, alignment.coordinates[:,0])
+    evidence = []
+    for col,(i,j) in enumerate(zip(*alignment.indices)):
+        if (i < 0) != (j < 0):
+            missing,other = (a,b) if i < 0 else (b,a)
+            gap_q,base_q = (fq,rq) if i < 0 else (rq,fq)
+            cursor,base_pos = (fc,int(j)) if i < 0 else (rc,int(i))
+            base = other[col]
+            if ((col == 0 or missing[col-1] != '-')
+                    and (col+1 == len(a) or missing[col+1] != '-') and base in 'ACGT'):
+                left=right=col
+                while left>0 and missing[left-1]==other[left-1]==base:
+                    left-=1
+                while right+1<len(a) and missing[right+1]==other[right+1]==base:
+                    right+=1
+                supports=[]
+                for position in range(left,right+1):
+                    shift=position-col
+                    at=cursor+shift
+                    flank=min(gap_q[at-1:at+1]) if 0<at<len(gap_q) else 0
+                    supports.append({'column':position+1,'support_q':int(min(base_q[base_pos+shift],flank))})
+                evidence.append({'column':col+1,'kind':'F Gap' if i<0 else 'R Gap',
+                                 'min_support_q':min(x['support_q'] for x in supports),
+                                 'max_support_q':max(x['support_q'] for x in supports),
+                                 'placements':supports})
+        if i>=0:fc=int(i)+1
+        if j>=0:rc=int(j)+1
+    return evidence
+
+
 def _align_overlap(forward: Read, reverse: Read, scores):
     """지정된 점수로 양방향 국소 정렬을 평가한다."""
     if not forward.sequence or not reverse.sequence:
@@ -438,6 +480,7 @@ def _align_overlap(forward: Read, reverse: Read, scores):
             "aligned_f": str(alignment[0]), "aligned_r": str(alignment[1]),
             "markers": "".join(markers),
             "events": events,
+            "equivalent_gap_support": equivalent_single_gap_support(alignment, fseq, rseq, forward.qualities, rq),
             "conflict_cluster": conflict_cluster(events, len(markers)),
             "q20_gap_regions": supported_gap_regions(events),
             "gap_outer_q20_anchors": gap_outer_q20_anchors(events, q20_agreements),
@@ -742,6 +785,113 @@ def supported_terminal_core(overlap):
             "core_junction_unaligned": core["junction_unaligned"]}
 
 
+def persistent_same_direction_gaps(overlap):
+    """짧은 연결 말단에 반복되는 같은 방향의 길이 차이와 약한 바깥 지지.
+
+    두 정렬에 같은 좌표로 유지되는, 가까운 단염기 Gap 두 개를 확인한다.
+    한 개는 Q20 이상이고 다른 하나는 Q20 미만이어야 한다. 동일 방향의
+    반복 차이를 기존 '고품질 Gap 한 개' 예외가 무조건 허용하지 않도록 한다.
+    """
+    if not overlap or overlap['paired_bases']>MAX_SHORT_GAP_PAIR_BASES:
+        return None
+    core=overlap.get('core_alignment')
+    if (not core or core['connection']!=overlap['connection']
+            or core['reverse_orientation']!=overlap['reverse_orientation']
+            or core['connection'] not in ('F → R','R → F')):
+        return None
+    gaps=[e for e in core['events'] if e['kind'] in ('F Gap','R Gap')]
+    alternatives={e['column']:e for e in core.get('equivalent_gap_support',[])}
+    lower_q=[alternatives.get(e['column'],{}).get('min_support_q',e['support_q']) for e in gaps]
+    if (len(gaps)!=2 or gaps[0]['kind']!=gaps[1]['kind'] or core['longest_gap']!=1
+            or not min(lower_q)<20<=max(lower_q)
+            or gaps[1]['column']-gaps[0]['column']>LOW_QUALITY_END_COLUMNS):
+        return None
+    def signature(e):
+        return tuple(e[k] for k in ('kind','f_position','r_position','support_q'))
+    if not all(signature(e) in [signature(x) for x in overlap['events']] for e in gaps):
+        return None
+    left=gaps[0]['column']-1
+    right=len(core['markers'])-gaps[1]['column']
+    side='left' if left<right else 'right'
+    if min(left,right)>LOW_QUALITY_END_COLUMNS or core['gap_outer_q20_anchors'][side]>=MIN_GAP_PAIR_OUTER_Q20:
+        return None
+    return {'gap_direction':gaps[0]['kind'], 'outer_columns':min(left,right),
+            'outer_q20_run':core['gap_outer_q20_anchors'][side],
+            'gap_spacing_columns':gaps[1]['column']-gaps[0]['column'],
+            'gap_support_q':[e['support_q'] for e in gaps], 'equivalent_min_support_q':lower_q}
+
+
+def supported_equivalent_gap_core(overlap):
+    """짧은 말단 불일치와 동점 Gap 배치가 겹친 경우만 제한적으로 허용.
+
+    연결 끝이 모두 맞는 짧은 정렬에서 Q20~29 불일치 하나만 말단 5열
+    이내 제외로 없어져야 한다. 내부에는 반대 방향 단염기 Gap 두 개만
+    남고, 같은 염기 안의 동점 배치로 강한 Gap 충돌은 한 개 이하가 되어야
+    한다. Q30 염기 불일치, 복수 잔여 충돌, 긴 미정렬 끝은 허용하지 않는다.
+    실제 ACE의 말단 제외·Gap 배치를 참고한 경험적 기준이다.
+    """
+    if not overlap or not MIN_OVERLAP_BASES<=overlap['paired_bases']<=MAX_SHORT_GAP_PAIR_BASES:
+        return None
+    core=overlap.get('core_alignment')
+    if (not core or core['connection']!=overlap['connection']
+            or core['reverse_orientation']!=overlap['reverse_orientation']
+            or overlap['connection'] not in ('F → R','R → F')
+            or overlap['junction_unaligned']!=0):
+        return None
+    if (overlap['gaps']!=2 or core['gaps']!=2
+            or overlap['longest_gap']!=1 or core['longest_gap']!=1
+            or overlap['mismatches']!=1 or overlap['ambiguous']
+            or core['mismatches'] or core['ambiguous'] or not core.get('opposing_gap_pair')
+            or core['paired_bases']<MIN_OVERLAP_BASES
+            or min(overlap['q20_matches'],core['q20_matches'])<MIN_CLIPPED_CORE_Q20_MATCHES
+            or min(overlap['gap_identity'],core['gap_identity'])<MIN_GAP_IDENTITY):
+        return None
+    removed=len(overlap['markers'])-len(core['markers'])
+    if (not 1<=removed<=MAX_CORE_TRIM_COLUMNS
+            or core['junction_unaligned']>MAX_CORE_TRIM_COLUMNS
+            or core['junction_q20']>MAX_CORE_TRIM_COLUMNS):
+        return None
+    def signature(e):
+        return tuple(e[k] for k in ('kind','f_position','r_position','support_q'))
+    original=[e for e in overlap['events'] if e['kind'] in ('F Gap','R Gap')]
+    if [signature(e) for e in original]!=[signature(e) for e in core['events']]:
+        return None
+    mismatch=next(e for e in overlap['events'] if e['kind']=='염기 불일치')
+    if not 20<=mismatch['support_q']<CORE_CONFLICT_QUALITY_LIMIT:
+        return None
+    size=len(core['markers'])
+    if not any(overlap['aligned_f'][left:left+size]==core['aligned_f']
+               and overlap['aligned_r'][left:left+size]==core['aligned_r']
+               and not left<mismatch['column']<=left+size
+               for left in range(removed+1)):
+        return None
+    alternatives=core.get('equivalent_gap_support',[])
+    if (len(alternatives)!=2
+            or {e['column'] for e in alternatives}!={e['column'] for e in core['events']}
+            or sum(e['min_support_q']>=20 for e in alternatives)>1
+            or not any(e['min_support_q']<20<=e['max_support_q'] for e in alternatives)):
+        return None
+    ordered=sorted(alternatives,key=lambda e:e['column'])
+    if max(p['column'] for p in ordered[0]['placements'])>=min(p['column'] for p in ordered[1]['placements']):
+        return None
+    return {'excluded_columns':removed,'excluded_mismatch_q':mismatch['support_q'],
+            'core_q20_matches':core['q20_matches'],
+            'gap_support_ranges':[[e['min_support_q'],e['max_support_q']] for e in alternatives]}
+
+
+def internal_low_quality_alignment(overlap):
+    """낮은 품질의 내부 유사성에 비해 고품질 연결 끝이 크게 남는 경우 경고."""
+    if not overlap or overlap['paired_bases']<=MAX_SHORT_GAP_PAIR_BASES:
+        return None
+    fraction=(overlap['q20_matches']+overlap['q20_conflicts'])/max(1,len(overlap['markers']))
+    if (fraction>=INTERNAL_REVIEW_MAX_Q20_FRACTION
+            or overlap['junction_q20']<=INTERNAL_REVIEW_MIN_JUNCTION_Q20):
+        return None
+    return {'q20_supported_fraction':fraction,'junction_q20':overlap['junction_q20'],
+            'message':'낮은 품질의 내부 구간끼리 맞물린 정렬입니다. 파일 생성 여부는 단정하기 어렵고, '
+                      'Contig 파일이 생성되어도 정상적인 F/R 연결로 인정하기 전에 정렬 확인이 필요합니다.'}
+
+
 def predict_contig(lengths, overlap, quality_bases=None):
     """품질이 뒷받침하는 충돌과 낮은 품질의 차이를 분리해 평가한다.
 
@@ -770,6 +920,7 @@ def predict_contig(lengths, overlap, quality_bases=None):
     terminal_realign_applied = False
     supported_pair = supported_short_gap_pair(overlap)
     supported_core = supported_terminal_core(overlap)
+    equivalent_core = supported_equivalent_gap_core(overlap)
     if overlap is None or overlap["paired_bases"] < MIN_OVERLAP_BASES:
         reasons.append(f"연결에 필요한 겹침이 {MIN_OVERLAP_BASES} bp 미만입니다.")
     if overlap is not None:
@@ -787,7 +938,7 @@ def predict_contig(lengths, overlap, quality_bases=None):
                                     and terminal_realign_supported(overlap))
         if (overlap["q20_conflict_rate"] > MAX_Q20_CONFLICT_RATE
                 and not single_indel and not terminal_gap_exception_applied
-                and not terminal_realign_applied and not supported_pair):
+                and not terminal_realign_applied and not supported_pair and not equivalent_core):
             reasons.append(f"복수 Gap 또는 염기 불일치의 Q20 충돌 비율이 {MAX_Q20_CONFLICT_RATE:.0%}를 초과합니다.")
         cluster = overlap["conflict_cluster"]
         if cluster["count"] >= MIN_CLUSTER_Q20_CONFLICTS:
@@ -808,8 +959,13 @@ def predict_contig(lengths, overlap, quality_bases=None):
             reasons.append(f"연결 경계에 정렬되지 않은 Q20 이상 염기가 {MAX_Q20_JUNCTION} bp를 초과합니다.")
         if overlap["longest_gap"] > MAX_GAP_RUN:
             reasons.append(f"연속 Gap이 {MAX_GAP_RUN} bp를 초과합니다.")
-        if not supported_pair:
+        if not supported_pair and not equivalent_core:
             reasons.extend(short_gap_pair_reasons(overlap))
+        same_direction=persistent_same_direction_gaps(overlap)
+        if same_direction:
+            reasons.append('같은 방향의 단염기 Gap 두 개가 짧은 말단에 반복되고, '
+                           f"그 바깥 연속 Q20 일치는 {same_direction['outer_q20_run']} bp로 "
+                           f'기준 {MIN_GAP_PAIR_OUTER_Q20} bp 미만입니다. 보수적 정렬에도 같은 차이가 남습니다 (검증용 보정).')
         extension = unsupported_terminal_extension(overlap)
         if extension and not supported_core:
             reasons.append(
@@ -847,7 +1003,11 @@ def predict_contig(lengths, overlap, quality_bases=None):
                     f"(Q20 이상 {overlap['junction_q20']} bp)로 허용 범위 안에 있습니다.",
                 ]}
     if reasons:
-        return {"label": "Contig2", "state": "separate", "generated": False, "reasons": reasons}
+        result = {"label": "Contig2", "state": "separate", "generated": False, "reasons": reasons}
+        warning=internal_low_quality_alignment(overlap)
+        if warning:
+            result['alignment_review']=warning
+        return result
     passed = ["겹침 길이·일치율·품질·연결 경계 기준을 통과했습니다."]
     if terminal_gap_exception_applied:
         passed.append("연결 끝까지 정렬된 단염기 Gap 두 개의 방향과 말단 위치 조건으로 "
@@ -863,6 +1023,12 @@ def predict_contig(lengths, overlap, quality_bases=None):
                       "(충돌 비율 예외: 검증용 보정).")
     result = {"label": "Contig 생성", "state": "joined", "generated": True, "reasons": passed}
     corrections = {}
+    if equivalent_core:
+        corrections['supported_equivalent_gap_core']=equivalent_core
+        passed.append(f"끝부분 {equivalent_core['excluded_columns']}개 정렬 열의 불일치를 제외하면 "
+                      f"양쪽 Q20 일치 {equivalent_core['core_q20_matches']} bp가 남습니다. "
+                      '같은 염기 안에서 빈칸을 옮겨도 동일하게 맞는 배치를 확인했으며, '
+                      '그 배치에서는 Q20 Gap 충돌이 한 개 이하라 제한적으로 연결을 허용했습니다 (검증용 보정).')
     if supported_pair:
         corrections["supported_short_gap_pair"] = supported_pair
         passed.append(f"반대 방향 단염기 Gap 두 개의 지지 Q가 {supported_pair['min_gap_support_q']}–"
@@ -925,6 +1091,9 @@ def summary_rows(rows):
             "긴 저품질 겹침 보정 적용": prediction.get("decision_rule") == "long_low_quality",
             "중심 Q20 지지 Gap 쌍 보정 적용": "supported_short_gap_pair" in prediction.get("applied_corrections", {}),
             "단순 중심 정렬 말단 보정 적용": "supported_terminal_core" in prediction.get("applied_corrections", {}),
+            "동점 Gap 배치와 말단 보정 적용": "supported_equivalent_gap_core" in prediction.get("applied_corrections", {}),
+            "같은 방향 반복 말단 Gap 검사": persistent_same_direction_gaps(row['overlap']) is not None,
+            "정렬 확인 경고": (prediction.get('alignment_review') or {}).get('message',''),
             "F Q20 Gap 구간": overlap.get("q20_gap_regions", {}).get("F", 0),
             "R Q20 Gap 구간": overlap.get("q20_gap_regions", {}).get("R", 0),
             "첫 Gap 앞 연속 Q20 일치 (bp)": overlap.get("gap_outer_q20_anchors", {}).get("left", 0),
@@ -1151,6 +1320,10 @@ def plain_reason(reason, row):
         e = row['prediction']['applied_corrections']['supported_short_gap_pair']
         return (f"작은 길이 차이 두 곳 사이에서 양쪽이 품질 좋게 연속 일치한 구간이 {e['between_q20_run']} bp입니다. "
                 "다른 정렬 방식에서도 이 근거가 유지되고 강한 품질 충돌이 없어, 보완 기준으로 연결을 허용했습니다.")
+    if reason.startswith('같은 방향의 단염기 Gap 두 개가'):
+        e=persistent_same_direction_gaps(o)
+        return (f"한쪽 서열에서 글자 수 차이가 두 번 반복됩니다. 그 바깥에서 양쪽이 품질 좋게 연속 일치한 부분은 "
+                f"{e['outer_q20_run']} bp뿐입니다. 전체 일치율이 높아도 이 끝부분의 연결 근거가 약해 Contig2로 예상합니다.")
     if reason.startswith('불안정한 말단 '):
         e = row['prediction']['applied_corrections']['supported_terminal_core']
         return (f"불확실한 끝부분을 제외해도 중심 {e['core_paired_bases']} bp가 겹치고, "
@@ -1408,6 +1581,9 @@ def render_result(rows, reads):
                     st.warning("Contig2 · 두 방향이 하나로 연결되지 않을 것으로 예상")
                 else:
                     st.warning("No contig · 연결에 쓸 서열이나 품질이 부족")
+                if prediction.get('alignment_review'):
+                    st.warning('정렬 확인 필요 · 파일이 생성되어도 정상 결합으로 해석하면 안 됩니다.')
+                    st.caption(prediction['alignment_review']['message'])
                 st.write(f"품질 정리 후 길이: F **{row['lengths'][0]} bp** · R **{row['lengths'][1]} bp**")
                 overlap = row["overlap"]
                 if overlap:
