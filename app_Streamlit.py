@@ -22,7 +22,7 @@ from Bio import SeqIO
 from Bio.Align import PairwiseAligner
 from Bio.Seq import Seq
 
-APP_VERSION = "2026.10.23-ab1-v17"
+APP_VERSION = "2026.10.28-ab1-v18"
 RERUN_RULE_VERSION = "quality-review-v1"
 # 재반응 전후 검증 전의 보수적 검토 기준. 성공 확률이나 사내 SOP가 아니다.
 RERUN_REFERENCE_FRACTION = 0.80
@@ -57,6 +57,8 @@ SHORT_GAP_MAX_SUPPORT_Q = 30  # exclusive
 MAX_SHORT_LOW_Q_JUNCTION = 5
 # 같은 염기 반복 안의 동점 Gap 배치와 짧은 말단 제외를 함께 확인한다.
 MIN_CLIPPED_CORE_Q20_MATCHES = 30
+# 짧은 연결에서 반복되는 같은 방향 단염기 Gap과 Q20 염기 차이의 동반 검사.
+MIN_PERSISTENT_SHORT_GAP_REGIONS = 3
 INTERNAL_REVIEW_MIN_JUNCTION_Q20 = 100
 INTERNAL_REVIEW_MAX_Q20_FRACTION = 0.20
 # 긴 겹침의 다수가 Q20 미만일 때만 사용하는 경험적 보정.
@@ -968,6 +970,50 @@ def supported_clipped_terminal_gap(overlap):
     return None
 
 
+def persistent_short_gap_mismatch(overlap):
+    """두 정렬에 반복되는 같은 방향 Gap과 품질 지지 염기 불일치를 찾는다.
+
+    짧은 연결의 단염기 Gap 세 구간 이상과 Q20 이상 염기 불일치가 모두
+    같은 read 좌표에서 유지될 때만 적용한다. 반대 방향 Gap 조합, 긴
+    겹침, 한두 Gap, 보수적 정렬에서 해소되는 차이는 이 검사로 제한하지
+    않는다. Q가 낮은 Gap을 버려 전체 충돌 비율만 낮아지는 경우를 보완한다.
+    실제 실패 ACE를 참고한 경험적 검사이며 조립기의 내부 규칙은 아니다.
+    """
+    if not overlap:
+        return None
+    core = overlap.get('core_alignment')
+    if (not core or overlap.get('connection') not in ('F → R', 'R → F')
+            or core.get('connection') != overlap.get('connection')
+            or core.get('reverse_orientation') != overlap.get('reverse_orientation')):
+        return None
+    gap_sets, mismatch_sets = [], []
+    def signature(event):
+        return tuple(event[k] for k in ('kind', 'f_position', 'r_position', 'support_q'))
+    for item in (overlap, core):
+        if (not MIN_OVERLAP_BASES <= item.get('paired_bases', 0) <= MAX_SHORT_GAP_PAIR_BASES
+                or item.get('longest_gap') != 1):
+            return None
+        gaps = [e for e in item.get('events', []) if e['kind'] in ('F Gap', 'R Gap')]
+        if len(gaps) < MIN_PERSISTENT_SHORT_GAP_REGIONS or len({e['kind'] for e in gaps}) != 1:
+            return None
+        mismatches = [e for e in item.get('events', [])
+                      if e['kind'] == '염기 불일치' and e['support_q'] >= 20]
+        if not mismatches:
+            return None
+        gap_sets.append({signature(e) for e in gaps})
+        mismatch_sets.append({signature(e) for e in mismatches})
+    common_gaps = gap_sets[0] & gap_sets[1]
+    common_mismatches = mismatch_sets[0] & mismatch_sets[1]
+    if len(common_gaps) < MIN_PERSISTENT_SHORT_GAP_REGIONS or not common_mismatches:
+        return None
+    return {'gap_direction': next(iter(common_gaps))[0],
+            'persistent_gap_regions': len(common_gaps),
+            'persistent_q20_mismatches': len(common_mismatches),
+            'mismatch_support_q': sorted(e[3] for e in common_mismatches),
+            'main_gap_regions': len(gap_sets[0]), 'core_gap_regions': len(gap_sets[1]),
+            'paired_bases': overlap['paired_bases'], 'core_paired_bases': core['paired_bases']}
+
+
 def internal_low_quality_alignment(overlap):
     """낮은 품질의 내부 유사성에 비해 고품질 연결 끝이 크게 남는 경우 경고."""
     if not overlap or overlap['paired_bases']<=MAX_SHORT_GAP_PAIR_BASES:
@@ -1056,6 +1102,13 @@ def predict_contig(lengths, overlap, quality_bases=None):
             reasons.append('같은 방향의 단염기 Gap 두 개가 짧은 말단에 반복되고, '
                            f"그 바깥 연속 Q20 일치는 {same_direction['outer_q20_run']} bp로 "
                            f'기준 {MIN_GAP_PAIR_OUTER_Q20} bp 미만입니다. 보수적 정렬에도 같은 차이가 남습니다 (검증용 보정).')
+        repeated_short = persistent_short_gap_mismatch(overlap)
+        if repeated_short:
+            reasons.append('짧은 겹침에서 같은 방향의 단염기 Gap '
+                           f"{repeated_short['persistent_gap_regions']}구간과 Q20 이상 염기 불일치 "
+                           f"{repeated_short['persistent_q20_mismatches']}개가 보수적 정렬에도 "
+                           '같은 read 위치에 남습니다. 전체 일치율만으로 연결을 허용하지 않습니다 '
+                           '(검증용 보정).')
         extension = unsupported_terminal_extension(overlap)
         if extension and not supported_core:
             reasons.append(
@@ -1094,6 +1147,10 @@ def predict_contig(lengths, overlap, quality_bases=None):
                 ]}
     if reasons:
         result = {"label": "Contig2", "state": "separate", "generated": False, "reasons": reasons}
+        if overlap is not None:
+            repeated_short = persistent_short_gap_mismatch(overlap)
+            if repeated_short:
+                result['rejection_evidence'] = {'persistent_short_gap_mismatch': repeated_short}
         warning=internal_low_quality_alignment(overlap)
         if warning:
             result['alignment_review']=warning
@@ -1191,6 +1248,8 @@ def summary_rows(rows):
             "동점 Gap 배치와 말단 보정 적용": "supported_equivalent_gap_core" in prediction.get("applied_corrections", {}),
             "저품질 말단 Gap 제외 보정 적용": "supported_clipped_terminal_gap" in prediction.get("applied_corrections", {}),
             "같은 방향 반복 말단 Gap 검사": persistent_same_direction_gaps(row['overlap']) is not None,
+            "짧은 겹침 반복 Gap·염기 차이 검사": persistent_short_gap_mismatch(row['overlap']) is not None,
+            "반복 Gap·염기 차이 상세": json.dumps(prediction.get('rejection_evidence', {}), ensure_ascii=False),
             "정렬 확인 경고": (prediction.get('alignment_review') or {}).get('message',''),
             "F Q20 Gap 구간": overlap.get("q20_gap_regions", {}).get("F", 0),
             "R Q20 Gap 구간": overlap.get("q20_gap_regions", {}).get("R", 0),
@@ -1414,6 +1473,12 @@ def plain_reason(reason, row):
         return '품질이 낮은 부분을 제외한 뒤 남은 서열이 너무 짧아 연결을 평가하기 어렵습니다. ' + reason
     if 'Q20 이상 유효 염기가' in reason:
         return reason.replace('Q20 이상 유효 염기', '품질 기준(Q20)을 넘는 A/C/G/T 염기')
+    if reason.startswith('짧은 겹침에서 같은 방향의 단염기 Gap'):
+        e = row['prediction']['rejection_evidence']['persistent_short_gap_mismatch']
+        return (f"짧은 연결 구간에서 한쪽의 글자 수 차이가 {e['persistent_gap_regions']}곳 반복되고, "
+                f"양쪽 품질이 뒷받침하는 염기 차이도 {e['persistent_q20_mismatches']}곳 남습니다. "
+                '더 엄격하게 정렬해도 같은 위치의 차이가 유지되어 Contig2로 예상합니다. '
+                '이 근거만으로 재반응할 방향을 확정하지는 않습니다.')
     if reason.startswith('저품질 말단 Gap을 포함한'):
         e = row['prediction']['applied_corrections']['supported_clipped_terminal_gap']
         return (f"끝의 불확실한 부분 {e['excluded_columns']}칸을 제외해도 양쪽이 품질 좋게 일치하는 "
