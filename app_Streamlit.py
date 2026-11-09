@@ -24,7 +24,7 @@ from Bio import SeqIO
 from Bio.Align import PairwiseAligner
 from Bio.Seq import Seq
 
-APP_VERSION = "2026.11.05-ab1-v22"
+APP_VERSION = "2026.11.09-ab1-v23"
 RERUN_RULE_VERSION = "quality-review-v1"
 # 재반응 전후 검증 전의 보수적 검토 기준. 성공 확률이나 사내 SOP가 아니다.
 RERUN_REFERENCE_FRACTION = 0.80
@@ -1293,6 +1293,84 @@ def persistent_moderate_bidirectional_gaps(overlap):
             'q20_supported_fraction': (overlap['q20_matches']+overlap['q20_conflicts']) / max(1,len(overlap['markers']))}
 
 
+def persistent_strong_gap_and_adjacent_mismatches(overlap):
+    """긴 겹침의 반복 Gap과 연속 염기 차이가 같은 read 위치에 남는지 확인.
+
+    긴 겹침의 양쪽 Q20 지지가 절반 이상이고 기본·보수적 정렬이 같은
+    방향과 연결을 나타내야 한다. 기본 정렬에 Q30 이상 Gap 세 구간이
+    양쪽 방향에 걸쳐 있으며, 두 정렬 모두에 동점 배치 전 범위가 Q30
+    이상인 양방향 Gap과 바로 이웃한 두 Q20 염기 불일치가 유지되는 경우다.
+    보수적 정렬이 말단을 5열 이내 제외하면 빠진 고품질 Gap이 실제 그
+    말단의 동일 read 위치와 겹치는지도 검사한다. 반복 염기에서 동점인
+    Gap은 선택된 위치 하나가 아닌 가능한 위치 집합으로 비교한다.
+    제공된 실측으로 보완한 제한적 검사이며 조립기 내부 규칙은 아니다.
+    """
+    if not overlap:
+        return None
+    core = overlap.get('core_alignment')
+    if (not core or overlap.get('connection') not in ('F → R', 'R → F')
+            or core.get('connection') != overlap.get('connection')
+            or core.get('reverse_orientation') != overlap.get('reverse_orientation')):
+        return None
+    for item in (overlap, core):
+        fraction = (item['q20_matches'] + item['q20_conflicts']) / max(1, len(item['markers']))
+        if item['paired_bases'] <= MAX_SHORT_GAP_PAIR_BASES or fraction < LONG_OVERLAP_MAX_Q20_FRACTION:
+            return None
+    left = [core[f'{role}_start'] - overlap[f'{role}_start'] for role in ('forward', 'reverse')]
+    right = [overlap[f'{role}_end'] - core[f'{role}_end'] for role in ('forward', 'reverse')]
+    removed = len(overlap['markers']) - len(core['markers'])
+    if (min(left + right) < 0 or (any(left) and any(right))
+            or not 0 <= removed <= MAX_CORE_TRIM_COLUMNS or max(left + right) > MAX_CORE_TRIM_COLUMNS
+            or (removed == 0 and any(left + right))
+            or (removed > 0 and not any(left + right))):
+        return None
+    gap_sets, mismatch_sets = [], []
+    for item in (overlap, core):
+        gaps = {_equivalent_gap_source_key(item, gap): gap
+                for gap in item['equivalent_gap_support'] if gap['min_support_q'] >= CORE_CONFLICT_QUALITY_LIMIT}
+        mismatches = {(event['f_position'], event['r_position'], event['support_q']): event
+                      for event in item['events']
+                      if event['kind'] == '염기 불일치' and event['support_q'] >= 20}
+        gap_sets.append(gaps)
+        mismatch_sets.append(mismatches)
+    shared = set(gap_sets[0]) & set(gap_sets[1])
+    if (len(gap_sets[0]) < 3 or len(shared) < 2
+            or not {'F Gap', 'R Gap'} <= {key[0] for key in shared}):
+        return None
+    common_mismatches = set(mismatch_sets[0]) & set(mismatch_sets[1])
+    adjacent = set()
+    for first in common_mismatches:
+        f, r, _ = first
+        for second in common_mismatches:
+            if (second[0] == f + 1 and second[1] == r + 1
+                    and all(mismatch_sets[i][second]['column'] == mismatch_sets[i][first]['column'] + 1
+                            for i in (0, 1))):
+                adjacent.update((first, second))
+    if not adjacent:
+        return None
+    # 주 정렬에서 빠진 Gap이 단순히 내부에서 재배치된 것은 아닌지 원본 절단 read 좌표로 대조한다.
+    excluded = []
+    for key in set(gap_sets[0]) - set(gap_sets[1]):
+        kind, positions = key
+        axis = 'reverse' if kind == 'F Gap' else 'forward'
+        if any(pos <= core[f'{axis}_start'] or pos > core[f'{axis}_end'] for pos in positions):
+            excluded.append(key)
+    if (removed and not excluded) or (not removed and len(shared) < 3):
+        return None
+    def gap_record(key):
+        gap = gap_sets[0][key]
+        event = next(e for e in overlap['events'] if e['column'] == gap['column'])
+        return {'kind': gap['kind'], 'min_support_q': gap['min_support_q'],
+                'max_support_q': gap['max_support_q'], 'aligned_read_positions': list(key[1]),
+                'main_event': event}
+    return {'shared_gaps': [gap_record(key) for key in sorted(shared)],
+            'excluded_terminal_gaps': [gap_record(key) for key in sorted(excluded)],
+            'adjacent_mismatch_events': [mismatch_sets[0][key] for key in sorted(adjacent)],
+            'main_high_q_gap_count': len(gap_sets[0]),
+            'core_excluded_columns': removed,
+            'position_convention': '1-based trimmed and oriented read positions'}
+
+
 def persistent_short_gap_mismatch(overlap):
     """두 정렬에 반복되는 같은 방향 Gap과 품질 지지 염기 불일치를 찾는다.
 
@@ -1589,6 +1667,13 @@ def predict_contig(lengths, overlap, quality_bases=None):
             reasons.append('양쪽 Q20 지지가 절반 이상인 긴 겹침에서 Q10 이상 지지 Gap이 '
                            f"F {counts['F']}구간, R {counts['R']}구간에 반복되고, "
                            '보수적 정렬에도 같은 read 위치에 남습니다 (검증용 보정).')
+        persistent_strong = persistent_strong_gap_and_adjacent_mismatches(overlap)
+        if persistent_strong:
+            reasons.append('긴 겹침에서 양방향 고품질 Gap과 연속된 Q20 염기 불일치가 '
+                           '보수적 정렬에서도 같은 read 위치에 남습니다. '
+                           f"말단 제외 {persistent_strong['core_excluded_columns']}개 정렬 열을 포함해 "
+                           '동점 Gap 배치의 품질 범위를 확인하여 전체 충돌 비율만으로 연결을 허용하지 않습니다 '
+                           '(검증용 보정).')
         extension = unsupported_terminal_extension(overlap)
         if extension and not supported_core:
             reasons.append(
@@ -1644,6 +1729,9 @@ def predict_contig(lengths, overlap, quality_bases=None):
             moderate_gaps = persistent_moderate_bidirectional_gaps(overlap)
             if moderate_gaps:
                 result.setdefault('rejection_evidence', {})['persistent_moderate_bidirectional_gaps'] = moderate_gaps
+            persistent_strong = persistent_strong_gap_and_adjacent_mismatches(overlap)
+            if persistent_strong:
+                result.setdefault('rejection_evidence', {})['persistent_strong_gap_and_adjacent_mismatches'] = persistent_strong
             if evidence.get('q30_gap_run', 0) > 1:
                 result.setdefault('rejection_evidence', {})['q30_gap_run'] = evidence['q30_gap_run']
             compensation = compensating_gap_conflicts(overlap)
@@ -1801,6 +1889,7 @@ def summary_rows(rows):
             "반대 Gap 배치의 Q30 염기 차이 검사": compensation is not None,
             "대체 배치의 Q30 염기 차이 개수": compensation['q30_mismatch_count'] if compensation else 0,
             "긴 겹침 양방향 반복 Gap 검사": persistent_moderate_bidirectional_gaps(row['overlap']) is not None,
+            "긴 겹침 고품질 Gap·연속 염기 차이 검사": persistent_strong_gap_and_adjacent_mismatches(row['overlap']) is not None,
             "같은 방향 반복 말단 Gap 검사": persistent_same_direction_gaps(row['overlap']) is not None,
             "짧은 겹침 반복 Gap·염기 차이 검사": persistent_short_gap_mismatch(row['overlap']) is not None,
             "반복 Gap·염기 차이 상세": json.dumps(prediction.get('rejection_evidence', {}), ensure_ascii=False),
@@ -2026,6 +2115,10 @@ def recommend_rerun(reads, rows):
 def plain_reason(reason, row):
     """기존 판정 규칙을 바꾸지 않고 그 의미를 쉬운 문장으로 설명한다."""
     o = row['overlap'] or {}
+    if reason.startswith('긴 겹침에서 양방향 고품질 Gap과'):
+        return ('긴 구간은 대부분 일치하지만 양쪽에서 품질이 높은 길이 차이와 연속된 염기 차이가 남습니다. '
+                '다른 정렬 방식에서도 같은 위치에 차이가 유지되어 Contig2로 예상합니다. '
+                '차이가 난 위치의 원본 파형을 함께 확인해 주세요.')
     if reason.startswith('양끝의 불안정한 단염기 Gap 쌍에서'):
         return ('짧은 연결 부위의 양끝에 길이 차이가 있습니다. 같은 점수로 맞는 빈칸 위치를 모두 비교하면 '
                 '품질이 낮은 차이라고만 볼 수 없고, 바깥쪽의 연속 품질 지지도 부족합니다. '
@@ -2420,6 +2513,15 @@ def render_result(rows, reads):
                 events=[e for block in compensation['blocks'] for e in block['q30_mismatch_events']]
                 comparison_row={**row,'overlap':{**core,'events':events}}
                 st.dataframe(pd.DataFrame(original_event_positions(comparison_row)),hide_index=True,use_container_width=True)
+            persistent_strong = row['prediction'].get('rejection_evidence', {}).get('persistent_strong_gap_and_adjacent_mismatches')
+            if persistent_strong:
+                st.write('**두 정렬에 남는 고품질 Gap과 연속 염기 차이**')
+                st.caption('반복 염기에서 가능한 동점 Gap 위치의 최소 지지 Q도 30 이상인 구간과 '
+                           '연속 Q20 불일치를 표시합니다. 이 패턴만으로 Mix 또는 InDel을 확정하지 않습니다.')
+                events = ([g['main_event'] for g in persistent_strong['shared_gaps']]
+                          + persistent_strong['adjacent_mismatch_events'])
+                comparison_row = {**row, 'overlap': {**o, 'events': sorted(events, key=lambda e: e['column'])}}
+                st.dataframe(pd.DataFrame(original_event_positions(comparison_row)), hide_index=True, use_container_width=True)
             tied_evidence = row['prediction'].get('applied_corrections', {}).get('supported_terminal_q20_gap_core', {})
             if tied_evidence.get('used_tied_core'):
                 st.write('**판정에 사용한 동점 중심 정렬**')
